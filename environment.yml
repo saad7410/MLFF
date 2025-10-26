@@ -1,0 +1,26 @@
+name: thesis
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11.9
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - networkx
+  - rdkit
+  - ase
+  # ---- PyTorch (GPU build) ----
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1   
+  - pip:
+      - pytorch-lightning>=2.3
+      - rich
+      - einops
+      - wandb
