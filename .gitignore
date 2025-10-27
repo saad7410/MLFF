@@ -14,5 +14,6 @@ build
 *.xyz
 wandb/
 ckpt_dir/
-verifysetup.py
+verifysetup_torch.py
+verifysetup_jax.py
 bin
