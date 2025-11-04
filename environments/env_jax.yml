@@ -1,0 +1,17 @@
+name: thesis_jax
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11.9
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - jax=0.7.2
+  - jaxlib=0.7.2=cuda129_py311h6669c4c_200
+  - cuda-version=12.9
+  - cudnn
+  - pip:
+    - flax
+    - optax
+    - wandb

@@ -1,14 +1,11 @@
-name: thesis
+name: thesis_torch
 channels:
   - pytorch
   - nvidia
   - conda-forge
 dependencies:
   - python=3.11.9
-  - pip:
-      - "jax[cuda13]"
-      - flax
-      - optax
+  - pip
   - numpy
   - scipy
   - pandas
