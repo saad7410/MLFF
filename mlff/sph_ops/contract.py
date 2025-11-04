@@ -4,7 +4,7 @@ import numpy as np
 
 import flax.linen as nn
 
-import pkg_resources
+import importlib.resources
 import pickle
 import itertools as it
 
@@ -12,11 +12,11 @@ from functools import partial
 from typing import (Callable, Sequence)
 
 
-indx_fn = lambda x: int((x+1)**2) if x >= 0 else 0
+def indx_fn(x): return int((x+1)**2) if x >= 0 else 0
 
 
 def load_cgmatrix():
-    stream = pkg_resources.resource_stream(__name__, 'cgmatrix.npz')
+    stream = importlib.resources.path(__name__, 'cgmatrix.npz')
     return np.load(stream)['cg']
 
 
@@ -192,7 +192,7 @@ def make_l0_contraction_fn(degrees, dtype=jnp.float32):
 
 def load_u_matrix():
 
-    stream = pkg_resources.resource_stream(__name__, 'u_matrix.pickle')
+    stream = importlib.resources.path(__name__, 'u_matrix.pickle')
     return pickle.load(stream)
 
 
