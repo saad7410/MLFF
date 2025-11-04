@@ -5,7 +5,10 @@ channels:
   - conda-forge
 dependencies:
   - python=3.11.9
-  - pip
+  - pip:
+      - "jax[cuda13]"
+      - flax
+      - optax
   - numpy
   - scipy
   - pandas
