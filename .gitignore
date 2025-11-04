@@ -17,3 +17,4 @@ ckpt_dir/
 verifysetup_torch.py
 verifysetup_jax.py
 bin
+.vscode
