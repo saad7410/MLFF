@@ -14,6 +14,12 @@ from mlff.io import read_json, save_dict, merge_dicts
 from mlff.data.preprocessing import get_per_atom_shift
 from mlff.properties import property_names as pn
 
+try:
+    from jax import tree as _jtree
+    tree_map = _jtree.map          # JAX ≥ 0.4.25 (incl. 0.6.x)
+except Exception:
+    from jax.tree_util import tree_map
+
 
 class DataSet:
     def __init__(self, prop_keys: Dict, data: Dict):
@@ -48,8 +54,8 @@ class DataSet:
             else:
                 return y
 
-        q_data = jax.tree_map(lambda y: reshape(y), q_data)
-        max_key = max(jax.tree_map(lambda y: len(y), q_data), key=jax.tree_map(lambda y: len(y), q_data).get)
+        q_data = tree_map(lambda y: reshape(y), q_data)
+        max_key = max(tree_map(lambda y: len(y), q_data), key=tree_map(lambda y: len(y), q_data).get)
         n_data = len(q_data[max_key])
 
         def repeat(name, y, repeats):
@@ -402,7 +408,7 @@ class DataSet:
         self.index_split(r_cut=r_cut, mic=mic, training=False, **subset_split)
 
     def save_splits_to_file(self, path, filename):
-        splits_ = jax.tree_map(lambda y: y.tolist(), self.splits)
+        splits_ = tree_map(lambda y: y.tolist(), self.splits)
         save_dict(path=path, filename=filename, data=splits_, exists_ok=True)
         print('Saved the data indices of the splits to {}'.format(os.path.join(path, filename)))
 
@@ -419,7 +425,7 @@ def tree_map_by_key(fn, x, keys):
     x_flat = flatten_dict(x)
     apply_mask = unflatten_dict({p: (p[-1] in keys) for p in x_flat})
     msk_fn = lambda y, m: fn(y) if m else y
-    return jax.tree_map(msk_fn, x, apply_mask)
+    return tree_map(msk_fn, x, apply_mask)
 
 
 def node_mask_required(z):

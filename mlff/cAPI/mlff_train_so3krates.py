@@ -8,6 +8,12 @@ import wandb
 import json
 import portpicker
 
+try:
+    from jax import tree as _jtree
+    tree_map = _jtree.map          # JAX ≥ 0.4.25 (incl. 0.6.x)
+except Exception:
+    from jax.tree_util import tree_map
+
 from pathlib import Path
 from typing import Dict
 from ase.units import *
@@ -295,7 +301,7 @@ def train_so3krates():
         n_train = len(all_data[0][prop_keys[pn.atomic_position]])
         n_valid = len(all_data[1][prop_keys[pn.atomic_position]])
 
-        data = jax.tree_map(lambda x, y: np.concatenate([x, y]), *all_data)
+        data = tree_map(lambda x, y: np.concatenate([x, y]), *all_data)
 
         data_set = DataSet(data=data, prop_keys=prop_keys)
         data_set.index_split(data_idx_train=list(range(n_train)),
@@ -447,7 +453,7 @@ def train_so3krates():
     train_ds = data_tuple(d['train'])
     valid_ds = data_tuple(d['valid'])
 
-    inputs = jax.tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
+    inputs = tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
     if restart_from_ckpt_dir is None:
         params = net.init(jax.random.PRNGKey(coach.net_seed), inputs)
     else:
