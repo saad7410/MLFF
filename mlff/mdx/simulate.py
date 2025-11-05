@@ -53,7 +53,7 @@ class SimulatorX:
                        }
 
             my_dict.update(x.observables)
-            my_dict_np = jax.tree_map(lambda u: np.asarray(u), my_dict)
+            my_dict_np = jax.tree_util.tree_map(lambda u: np.asarray(u), my_dict)
             hdf5_store.append(my_dict_np)
 
         self.save_trajectory = save_trajectory

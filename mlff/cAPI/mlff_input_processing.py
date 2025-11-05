@@ -39,7 +39,7 @@ def to_mlff_input():
             else:
                 raise RuntimeError(f'Unknown data type {type(u)} in --kwargs.')
 
-        kwargs = jax.tree_map(lambda x: to_bool(x), kwargs)
+        kwargs = jax.tree_util.tree_map(lambda x: to_bool(x), kwargs)
 
     input_file = Path(args.input_file).absolute()
     output_file = Path(args.output_file).absolute() if args.output_file is not None else None

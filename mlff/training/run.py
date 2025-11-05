@@ -75,7 +75,7 @@ def valid_epoch(state: TrainState,
     idxs = idxs[:steps_per_epoch * bs]  # skip incomplete batch
     idxs = idxs.reshape((steps_per_epoch, bs))
     for idx in idxs:
-        batch = jax.tree_map(lambda y: y[idx, ...], ds)
+        batch = jax.tree_util.tree_map(lambda y: y[idx, ...], ds)
         # batch = (Dict[str, Array[perm, ...]], Dict[str, Array[perm, ...]])
         # TODO: replace valid_step_fn with metric_fn
         metrics = valid_step_fn(state, batch, metric_fn)
@@ -201,9 +201,9 @@ def run_training(state: TrainState,
             perms = perms[:steps_per_epoch * train_bs]  # skip incomplete batch
             perms = perms.reshape((steps_per_epoch, train_bs))
 
-        train_batch = jax.tree_map(lambda y: y[perms[step_in_epoch], ...], train_ds)
+        train_batch = jax.tree_util.tree_map(lambda y: y[perms[step_in_epoch], ...], train_ds)
         if loss_fn_input is not None:
-            loss_input_batch = jax.tree_map(lambda y: y[perms[step_in_epoch], ...], loss_fn_input)
+            loss_input_batch = jax.tree_util.tree_map(lambda y: y[perms[step_in_epoch], ...], loss_fn_input)
             train_batch = train_batch + loss_input_batch
         train_start = time.time()
         state, train_batch_metrics, grads = train_step_fn(state=state, batch=train_batch, loss_fn=loss_fn)
@@ -225,12 +225,12 @@ def run_training(state: TrainState,
                 logging.warning(f'NaN detected during training in step {i} in gradient values. Reload the '
                                 'last checkpoint.')
 
-            grads_np = jax.tree_map(lambda x: x.tolist(), jax.device_get(grads))
+            grads_np = jax.tree_util.tree_map(lambda x: x.tolist(), jax.device_get(grads))
             save_dict(ckpt_dir, filename=f'gradients_nan_step_{i}.json', data=unfreeze(grads_np), exists_ok=True)
 
             def reset_records():
-                x = jax.tree_map(lambda x: jnp.zeros(x.shape), state.params['record'])
-                y = jax.tree_map(lambda x: jnp.zeros(x.shape), state.valid_params['record'])
+                x = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape), state.params['record'])
+                y = jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape), state.valid_params['record'])
                 return x, y
 
             state_dict = mngr.restore(mngr.best_step(), items={'state': None})['state']

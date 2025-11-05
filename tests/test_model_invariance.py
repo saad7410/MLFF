@@ -110,9 +110,9 @@ def _test_SO3_invariance_model(net):
 
     ds = data_tuple(d['train'])
 
-    params = net.init(jax.random.PRNGKey(0), jax.tree_map(lambda x: jnp.array(x[0, ...]), ds[0]))
+    params = net.init(jax.random.PRNGKey(0), jax.tree_util.tree_map(lambda x: jnp.array(x[0, ...]), ds[0]))
 
-    inputs = jax.tree_map(lambda x: jnp.array(x), ds[0])
+    inputs = jax.tree_util.tree_map(lambda x: jnp.array(x), ds[0])
     base = obs_fn(params, inputs)
     E_base = base['E']
     F_base = base['F']
@@ -165,7 +165,7 @@ def _test_padding_invariance_model(net):
 
     params = net.init(jax.random.PRNGKey(0), jax.tree_map(lambda x: jnp.array(x[0, ...]), ds[0]))
 
-    inputs = jax.tree_map(lambda x: jnp.array(x), ds[0])
+    inputs = jax.tree_util.tree_map(lambda x: jnp.array(x), ds[0])
     base = obs_fn(params, inputs)
     E_base = base['E']
     F_base = base['F']

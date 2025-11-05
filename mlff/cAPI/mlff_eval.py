@@ -171,7 +171,7 @@ def evaluate():
 
     def test_obs_fn(params, inputs):
         z_key = prop_keys[pn.atomic_type]
-        nn_out = jax.tree_map(lambda _x: np.array(_x, dtype=np.float64), _test_obs_fn(params, inputs))
+        nn_out = jax.tree_util.tree_map(lambda _x: np.array(_x, dtype=np.float64), _test_obs_fn(params, inputs))
         z = inputs[z_key]  # shape: (B,n)
 
         if pn.stress in targets:

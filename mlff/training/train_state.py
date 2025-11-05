@@ -79,7 +79,7 @@ class CustomTrainState(struct.PyTreeNode):
 
         _cd_decay = self.lr_decay_fn(self.step)
 
-        updates = jax.tree_map(lambda x: jnp.asarray(x*_cd_plateau*_cd_decay).astype(jnp.asarray(x).dtype), updates)
+        updates = jax.tree_util.tree_map(lambda x: jnp.asarray(x*_cd_plateau*_cd_decay).astype(jnp.asarray(x).dtype), updates)
         new_params = optax.apply_updates(self.params, updates)
 
         if self.polyak_step_size is not None:

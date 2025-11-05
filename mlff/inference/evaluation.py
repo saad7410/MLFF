@@ -10,7 +10,7 @@ Array = Any
 
 
 def tree_concatenate_tensors(py_tree_1, py_tree_2, axis=0):
-    return jax.tree_map(lambda x, y: np.concatenate([x, y], axis=axis), py_tree_1, py_tree_2)
+    return jax.tree_util.tree_map(lambda x, y: np.concatenate([x, y], axis=axis), py_tree_1, py_tree_2)
 
 
 def evaluate_model(params,
@@ -65,16 +65,16 @@ def evaluate_model(params,
         # if verbose:
         #     logging.info("Evaluate batch {} from {}".format(i + 1, n_batches))
 
-        input_batch = jax.tree_map(lambda y: y[idx, ...], inputs)
+        input_batch = jax.tree_util.tree_map(lambda y: y[idx, ...], inputs)
         obs_pred_ = obs_fn(params, input_batch)
         if len(obs_pred) == 0:
             obs_pred.update(obs_pred_)
         else:
             obs_pred = tree_concatenate_tensors(obs_pred, obs_pred_, axis=0)
 
-    inputs = jax.tree_map(lambda x: x[:int(n_batches * batch_size)], inputs)
+    inputs = jax.tree_util.tree_map(lambda x: x[:int(n_batches * batch_size)], inputs)
     if targets is not None:
-        targets = jax.tree_map(lambda x: x[:int(n_batches * batch_size)], targets)
+        targets = jax.tree_util.tree_map(lambda x: x[:int(n_batches * batch_size)], targets)
 
     # make sure that metrics are only calculated for quantities that appear in both, the output and the target.
     if len(set(obs_pred.keys()) ^ set(targets.keys())) != 0:
@@ -92,7 +92,7 @@ def evaluate_model(params,
     if metric_fn is not None:
         # flattened_predictions = jax.tree_map(lambda x: x[:int(n_batches * batch_size)], obs_pred)
         for m_name, m_fn in metric_fn.items():
-            metrics[m_name] = jax.tree_map(lambda x, y: m_fn(prediction=x, target=y), obs_pred_eval, target_eval)
+            metrics[m_name] = jax.tree_util.tree_map(lambda x, y: m_fn(prediction=x, target=y), obs_pred_eval, target_eval)
 
     return metrics, {'inputs': inputs, 'predictions': obs_pred, 'targets': targets}
 

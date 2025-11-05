@@ -172,7 +172,7 @@ def test_so3krates_training():
     train_ds = data_tuple(d['train'])
     valid_ds = data_tuple(d['valid'])
 
-    inputs = jax.tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
+    inputs = jax.tree_util.tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
     params = net.init(jax.random.PRNGKey(coach.net_seed), inputs)
     train_state, h_train_state = create_train_state(net,
                                                     params,

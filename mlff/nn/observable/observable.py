@@ -196,7 +196,7 @@ def make_e_rep_fn(prop_keys, ds, cutoff_fn='cosine_cutoff_fn', r_cut=5, mic=Fals
     init_inputs = {'phi_r_cut': jnp.ones(P),
                    'd_ij': jnp.ones(P),
                    'pair_mask': jnp.zeros(P),
-                   **jax.tree_map(lambda x: jnp.array(x[0, ...]), ds[0])}
+                   **jax.tree_util.tree_map(lambda x: jnp.array(x[0, ...]), ds[0])}
 
     zbl_repulsion = ZBLRepulsion(prop_keys=prop_keys)
     p = zbl_repulsion.init(jax.random.PRNGKey(0), init_inputs)
@@ -246,7 +246,7 @@ def estimate_zbl_repulsion_contribution(prop_keys, ds, cutoff_fn, r_cut, mic=Fal
 
     x = np.zeros(batch_size)
     for b in range(B):
-        train_batch = jax.tree_map(lambda y: y[int(b*batch_size):int((b+1)*batch_size), ...], ds[0])
+        train_batch = jax.tree_util.tree_map(lambda y: y[int(b*batch_size):int((b+1)*batch_size), ...], ds[0])
         x += np.array(e_rep_fn(train_batch), dtype=np.float64)
 
     x = x / B
