@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+authors = [
+    { name = "Thorben Frank" },
+    { name = "Saad Khan", email = "saadkhan7410@gmail.com" },
+]
+name = "mlff"
+version = "0.3.0"
+description = "Build Neural Networks for Force Fields with JAX"
+readme = { file = "README.md", content-type = "text/markdown" }
+license-files = ["LICENSE.md"]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "flax",
+    "jaxopt",
+    "jraph",
+    "optax",
+    "orbax-checkpoint == 0.11.5",
+    "portpicker",
+    "importlib",
+    # 'tensorflow',
+    "scikit-learn",
+    "ase",
+    "tqdm",
+    "wandb",
+    "pyyaml",
+    "pytest",
+    "h5py",
+    "netcdf4>=1.7.2",
+]
+keywords = [
+    "machine learning",
+    "force fields",
+    "chemistry",
+    "molecular dynamics",
+    "MD",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+mlff = ["sph_ops/cgmatrix.npz", "sph_ops/u_matrix.pickle"]
+
+[tool.uv.sources]
+shnitsel-tools = { git = "https://github.com/Reshief/shnitsel-tools.git", branch = "develop" }
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        #{ extra = "cu11" },
+        { extra = "cu12" },
+        #{ extra = "cu13" },
+    ],
+]
+
+[project.optional-dependencies]
+cpu = ["jax==0.6.0"]
+cu12 = ["jax[cuda12]==0.6.0"]
+#cu13 = ["jax[cuda13]==0.6.0"]
+#cu11 = ["jax[cuda11]==0.6.0"]
+shnitsel = ["shnitsel-tools>=0.0.1.2"]
+
+[project.scripts]
+evaluate = "mlff.cAPI.mlff_eval:evaluate"
+train = "mlff.cAPI.mlff_train:train"
+run_md = "mlff.cAPI.mlff_md:run_md"
+run_relaxation = "mlff.cAPI.mlff_structure_relaxation:run_relaxation"
+analyse_md = "mlff.cAPI.mlff_analyse:analyse_md"
+train_so3krates = "mlff.cAPI.mlff_train_so3krates:train_so3krates"
+train_so3kratACE = "mlff.cAPI.mlff_train_so3kratace:train_so3kratace"
+trajectory_to_xyz = "mlff.cAPI.mlff_postprocessing:trajectory_to_xyz"
+to_mlff_input = "mlff.cAPI.mlff_input_processing:to_mlff_input"
+
+[project.urls]
+"Homepage" = "https://github.com/thorben-frank/mlff"
+"Bug Tracker" = "https://github.com/thorben-frank/mlff/issues"
