@@ -5,6 +5,7 @@ import numpy as np
 import flax.linen as nn
 
 import importlib.resources
+
 import pickle
 import itertools as it
 
@@ -16,7 +17,7 @@ def indx_fn(x): return int((x+1)**2) if x >= 0 else 0
 
 
 def load_cgmatrix():
-    my_resources = importlib.resources.files(__name__)
+    my_resources = importlib.resources.files(__package__)
     with my_resources.joinpath("cgmatrix.npz").open("rb") as stream:
         return np.load(stream, allow_pickle=True)["cg"]
 
