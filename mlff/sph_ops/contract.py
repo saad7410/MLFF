@@ -9,16 +9,16 @@ import pickle
 import itertools as it
 
 from functools import partial
-from typing import (Callable, Sequence)
+from typing import Callable, Sequence
 
 
 def indx_fn(x): return int((x+1)**2) if x >= 0 else 0
 
 
 def load_cgmatrix():
-    stream = importlib.resources.path(__name__, 'cgmatrix.npz')
-    return np.load(stream)['cg']
-
+    my_resources = importlib.resources.files(__name__)
+    with my_resources.joinpath("cgmatrix.npz").open("rb") as stream:
+        return np.load(stream, allow_pickle=True)["cg"]
 
 def init_clebsch_gordan_matrix(degrees, l_out_max=None):
     """
@@ -191,9 +191,13 @@ def make_l0_contraction_fn(degrees, dtype=jnp.float32):
 
 
 def load_u_matrix():
-
-    stream = importlib.resources.path(__name__, 'u_matrix.pickle')
-    return pickle.load(stream)
+    # Change __name__ to the explicit package name of the directory containing the file
+    # This directory (mlff/sph_ops) contains an __init__.py, making it a package.
+    my_resources = importlib.resources.files('mlff.sph_ops') 
+    
+    # Open the resource file as a binary stream
+    with my_resources.joinpath('u_matrix.pickle').open('rb') as stream:
+        return pickle.load(stream)
 
 
 def degrees_to_str(x):
