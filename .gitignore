@@ -19,3 +19,4 @@ verifysetup_jax.py
 bin
 .vscode
 *module/
+archive/
