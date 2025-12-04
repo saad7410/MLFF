@@ -1,16 +1,23 @@
+#!/usr/bin/env python3
 """
 Usage:
-    python filteringscript.py path/to/my_dynamic.nc
+    python filteringscript_npz.py path/to/my_dynamic.nc
 
 This will create, in the SAME directory as the .nc file:
 
-    my_dynamic_filtered_state_1.extxyz
-    my_dynamic_filtered_state_2.extxyz
-    my_dynamic_filtered_state_3.extxyz
+    my_dynamic_filtered_state_1.npz
+    my_dynamic_filtered_state_2.npz
+    my_dynamic_filtered_state_3.npz
     ...
 
-One file per electronic state, containing only frames where that state
-was the ACTIVE state (according to `astate`).
+One file per electronic state, containing ONLY frames where that state
+was the ACTIVE state (according to `astate`), in NPZ format.
+
+Each NPZ contains:
+    R : (n_frames, n_atoms, 3)
+    F : (n_frames, n_atoms, 3)
+    E : (n_frames,)
+    z : (n_frames, n_atoms)
 """
 
 import sys
@@ -19,8 +26,6 @@ import re
 
 import xarray as xr
 import numpy as np
-from ase import Atoms
-from ase.io import write
 from ase.data import atomic_numbers
 
 
@@ -55,32 +60,28 @@ def main(nc_path_str: str) -> None:
     atNames = ds["atNames"]
     astate = ds["astate"]
 
-    # figure out dim names from the dataset (more robust than assuming)
-    state_dim = energy.dims[0]
-    time_dim = energy.dims[1]
-    atom_dim = atXYZ.dims[0]
-    xyz_dim = atXYZ.dims[1]
+    # infer dimension names
+    state_dim, time_dim = energy.dims          # e.g. ('state', 'time')
+    atom_dim, xyz_dim, _ = atXYZ.dims          # e.g. ('atom', 'xyz', 'time')
 
     nstates = energy.sizes[state_dim]
     nframes = energy.sizes[time_dim]
     natoms = atXYZ.sizes[atom_dim]
 
-    # astate might be 0-based or 1-based; make it a plain NumPy array first
+    # astate might be 0-based or 1-based; fix to 0-based
     astate_vals = astate.values.astype(int)
     if astate_vals.max() == nstates:
-        # likely 1-based (1..nstates) → convert to 0..nstates-1
         astate_vals = astate_vals - 1
 
-    # convert atom names → atomic numbers once
-    species = []
+    # atom names → atomic numbers (length natoms)
+    Z = []
     for raw in atNames.values:
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode()
-        species.append(elem_from_name(str(raw)))
-    Z = [atomic_numbers[s] for s in species]
+        Z.append(atomic_numbers[elem_from_name(str(raw))])
+    Z = np.array(Z, dtype=int)                 # shape: (natoms,)
 
-    stem = nc_path.stem  # e.g. "A03_butene_0p50fs_dynamic"
-
+    stem = nc_path.stem
     print(f"Found {nstates} electronic states, {nframes} frames, {natoms} atoms.")
     print(f"Dimensions: state={state_dim}, time={time_dim}, atom={atom_dim}, xyz={xyz_dim}")
 
@@ -90,37 +91,48 @@ def main(nc_path_str: str) -> None:
         frame_idx = np.where(mask)[0]
 
         if frame_idx.size == 0:
-            print(f"State {state_idx} (label {state_idx+1}): no active frames, skipping.")
+            print(f"State {state_idx} (label {state_idx+1}): no frames → skipping.")
             continue
 
-        # use .isel to select only those time indices
-        atXYZ_sel = atXYZ.isel({time_dim: frame_idx})                # (atom, xyz, n_sel)
-        energy_sel = energy.isel({state_dim: state_idx,
-                                  time_dim: frame_idx})              # (n_sel,)
-        forces_sel = forces.isel({state_dim: state_idx,
-                                  time_dim: frame_idx})              # (atom, xyz, n_sel)
+        # select only those time indices for this state
+        atXYZ_sel = atXYZ.isel({time_dim: frame_idx})  # (atom, xyz, n_sel)
+        energy_sel = energy.isel(
+            {state_dim: state_idx, time_dim: frame_idx}
+        )                                               # (n_sel,)
+        forces_sel = forces.isel(
+            {state_dim: state_idx, time_dim: frame_idx}
+        )                                               # (atom, xyz, n_sel)
 
-        # convert to NumPy for ASE
-        pos_all = np.moveaxis(atXYZ_sel.values, -1, 0)   # (n_sel, atom, xyz)
-        E_all = energy_sel.values                        # (n_sel,)
-        F_all = np.moveaxis(forces_sel.values, -1, 0)    # (n_sel, atom, xyz)
+        # convert to NumPy, putting time axis first
+        R_all = np.moveaxis(atXYZ_sel.values, -1, 0)    # (n_sel, atom, xyz)
+        E_all = energy_sel.values                       # (n_sel,)
+        F_all = np.moveaxis(forces_sel.values, -1, 0)   # (n_sel, atom, xyz)
 
-        images = []
-        for pos, E, F in zip(pos_all, E_all, F_all):
-            atoms = Atoms(numbers=Z, positions=pos)
-            atoms.info["energy"] = float(E)
-            atoms.arrays["forces"] = np.asarray(F, dtype=float)
-            images.append(atoms)
+        n_sel = R_all.shape[0]
 
-        out_name = f"{stem}_filtered_state_{state_idx+1}.extxyz"
+        # broadcast Z to (n_sel, natoms) as required by SO3krates ('z' key)
+        z_full = np.broadcast_to(Z, (n_sel, natoms))    # (n_sel, natoms)
+
+        out_name = f"{stem}_filtered_state_{state_idx+1}.npz"
         out_path = nc_path.with_name(out_name)
-        write(out_path.as_posix(), images)
-        print(f"State {state_idx} (label {state_idx+1}): "
-              f"{len(images)} frames → {out_path.name}")
+
+        # Only the keys SO3krates expects
+        np.savez_compressed(
+            out_path.as_posix(),
+            R=R_all,
+            F=F_all,
+            E=E_all,
+            z=z_full,
+        )
+
+        print(
+            f"State {state_idx} (label {state_idx+1}): "
+            f"{n_sel} frames → {out_path.name}"
+        )
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python filteringscript.py path/to/my_dynamic.nc")
+        print("Usage: python filteringscript_npz.py path/to/my_dynamic.nc")
         sys.exit(1)
     main(sys.argv[1])
