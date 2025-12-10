@@ -1,4 +1,3 @@
-# nc2extxyz_butene.py
 from pathlib import Path
 import re
 import numpy as np
@@ -7,7 +6,6 @@ from ase import Atoms
 from ase.io import write
 from ase.data import atomic_numbers
 
-# ---- small helpers ---------------------------------------------------------
 
 def elem_from_name(s: str) -> str:
     """

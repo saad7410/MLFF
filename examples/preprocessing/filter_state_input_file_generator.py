@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Usage:
     python filteringscript_npz.py path/to/my_dynamic.nc
