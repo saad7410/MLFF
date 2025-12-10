@@ -1,5 +1,5 @@
 from netCDF4 import Dataset
-ds = Dataset("/hades/skhan/repos/MLFF/data/A03_53310/A03_butene_0p50fs_dynamic.nc")
+ds = Dataset("/hades/skhan/repos/MLFF/data/schnitsel/fixed/A03_butene_0p50fs_dynamic.nc")
 print("VARS:", list(ds.variables.keys()))
 print("GLOBAL ATTRS:", ds.ncattrs())
 for k,v in ds.variables.items():
