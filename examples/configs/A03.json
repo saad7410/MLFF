@@ -1,6 +1,6 @@
 {
   "data": {
-    "nc_path": "/hades/skhan/repos/MLFF/data/schnitsel/fixed/A03_butene_0p50fs_dynamic.nc",
+    "nc_path": "/hades/skhan/repos/MLFF/data/shnitsel/fixed/A03_butene_0p50fs_dynamic.nc",
     "state_index": 1,              
     "r_cut": 5.0,
     "n_train": 13000,
