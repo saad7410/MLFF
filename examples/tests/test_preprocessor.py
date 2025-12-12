@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import numpy as np
-
+import argparse
 from examples.preprocessing.schnitsel_preprocessor import ShnitselPreprocessor 
 
 
@@ -76,7 +76,18 @@ def inspect_filtered_state_npz(npz_path: Path, state_index: int) -> None:
 
 
 def main() -> None:
-    nc_path = Path("/hades/skhan/repos/MLFF/data/schnitsel/fixed/A03_butene_0p50fs_dynamic.nc")
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "filename",  
+        type=str,    
+        help="path to file"
+    )
+
+    args = parser.parse_args()
+
+    nc_path = Path(args.filename)
 
     # Initialize preprocessor
     prep = ShnitselPreprocessor(nc_path)
