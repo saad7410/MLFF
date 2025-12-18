@@ -186,6 +186,7 @@ def main() -> None:
             n_heads = candidate
             break
 
+    #convert int to list as so3krates requirement
     degrees = list(range(1, degree + 1))
 
     sphc_norm = float(cfg["model"].get("sphc_normalization", 1.0))

@@ -15,7 +15,7 @@
     "sphc_normalization": 1.0
   },
   "training": {
-    "batch_size": 5,
+    "batch_size": 32,
     "n_epochs": 1000,
     "learning_rate": 1e-4,
     "transition_steps": 10000,
@@ -26,6 +26,6 @@
   },
   "logging": {
     "ckpt_root": "module",
-    "experiment_name": "A01_ethene_L3_F32_s0"
+    "experiment_name": "A01_ethene_L3_F32_s0_bat32"
   }
 }
