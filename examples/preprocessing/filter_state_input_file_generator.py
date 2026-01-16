@@ -88,6 +88,7 @@ def main(nc_path_str: str) -> None:
         # frames where THIS state is the active state
         mask = (astate_vals == state_idx)
         frame_idx = np.where(mask)[0]
+        print(len(frame_idx))
 
         if frame_idx.size == 0:
             print(f"State {state_idx} (label {state_idx+1}): no frames → skipping.")
