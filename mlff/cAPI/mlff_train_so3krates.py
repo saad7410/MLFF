@@ -20,7 +20,7 @@ from ase.units import *
 
 from mlff.io import create_directory, bundle_dicts, save_dict, load_params_from_ckpt_dir
 from mlff.training import Coach, Optimizer, get_loss_fn, create_train_state
-from mlff.data import DataTuple, DataSet
+from mlff.data import DataTuple, DataSet, load_precomputed_graph_metadata, select_data_for_model
 from mlff.cAPI.process_argparse import StoreDictKeyPair
 from mlff.nn.stacknet import get_obs_and_force_fn, get_observable_fn, get_energy_force_stress_fn
 from mlff.nn import So3krates
@@ -94,6 +94,9 @@ def train_so3krates():
     parser.add_argument('--H', type=int, required=False, default=4, help='Number of heads.')
     parser.add_argument('--degrees', nargs='+', type=int, required=False, default=[1, 2, 3],
                         help='Degrees for the spherical harmonic coordinates.')
+
+    parser.add_argument('--bond_aware', action='store_true', required=False,
+                        help='Enable invariant bond conditioning from a precomputed NPZ graph.')
 
     parser.add_argument('--so3krates_layer_kwargs', type=json.loads, required=False, default=None,
                         metavar='{"key": value, "key1": value1, ...}',
@@ -169,7 +172,11 @@ def train_so3krates():
 
     args = parser.parse_args()
 
-    prop_keys = args.prop_keys
+    # Copy parser defaults before adding opt-in bond properties to avoid mutating the shared mapping.
+    prop_keys = dict(args.prop_keys)
+    prop_keys.setdefault(pn.pair_mask, pn.pair_mask)
+    prop_keys.setdefault(pn.bond_prob, pn.bond_prob)
+    prop_keys.setdefault(pn.bond_mask, pn.bond_mask)
 
     def parse_data_file(x):
         if x is not None:
@@ -188,6 +195,16 @@ def train_so3krates():
         data_files = [train_data_file, valid_data_file]
     else:
         data_files = [data_file]
+
+    if args.bond_aware:
+        # The first bond-aware port consumes only nonperiodic NPZ files with a fixed graph.
+        non_npz_files = [path for path in data_files if Path(path).suffix != '.npz']
+        if non_npz_files:
+            raise ValueError('`--bond_aware` accepts only NPZ input files with precomputed graph arrays.')
+        if args.mic:
+            raise ValueError('`--bond_aware` currently supports only nonperiodic precomputed graphs.')
+        if args.restart_from_ckpt_dir is not None:
+            raise ValueError('Bond-aware SO3krates models must be trained from fresh initialization.')
 
     shift_by = args.shift_by
     shifts = args.shifts
@@ -235,8 +252,14 @@ def train_so3krates():
     steps = args.steps
     lr_stop = args.lr_stop
 
-    inputs = args.inputs
+    inputs = list(args.inputs)
     targets = args.targets
+
+    if args.bond_aware:
+        # Ensure Coach/DataTuple preserve the fixed edge mask and both bond descriptor tensors.
+        for bond_input in (pn.pair_mask, pn.bond_prob, pn.bond_mask):
+            if bond_input not in inputs:
+                inputs.append(bond_input)
 
     mic = args.mic
     if mic:
@@ -270,10 +293,14 @@ def train_so3krates():
             conversion_table[k] = eval(v)
 
     all_data = []
+    graph_metadata = []
     for d in data_files:
         extension = os.path.splitext(d)[1]
         if extension == '.npz':
-            data = dict(np.load(d))
+            # Disable object loading so the graph contract remains numeric and inspectable.
+            data = dict(np.load(d, allow_pickle=False))
+            if args.bond_aware:
+                graph_metadata.append(load_precomputed_graph_metadata(d, r_cut=r_cut))
         else:
             load_stress = pn.stress in targets
             data_loader = AseDataLoader(d, load_stress=load_stress, neighbors_format='dense')
@@ -295,6 +322,13 @@ def train_so3krates():
             cells = data[cell_key]  # shape: (B,3,3)
             cell_volumes = np.abs(np.linalg.det(cells))  # shape: (B)
             data[stress_key] = stress * cell_volumes[:, None, None]
+
+        if args.bond_aware:
+            # Keep only declared model inputs and targets before DataSet can reshape unrelated metadata.
+            data = select_data_for_model(data=data,
+                                         inputs=inputs,
+                                         targets=targets,
+                                         prop_keys=prop_keys)
         all_data += [data]
 
     if len(all_data) == 2:
@@ -303,23 +337,29 @@ def train_so3krates():
 
         data = jax.tree_util.tree_map(lambda x, y: np.concatenate([x, y]), *all_data)
 
-        data_set = DataSet(data=data, prop_keys=prop_keys)
+        # Reuse available sidecar tolerance metadata after both fixed-graph datasets are concatenated.
+        combined_metadata = next((metadata for metadata in graph_metadata if metadata is not None), None)
+        data_set = DataSet(data=data, prop_keys=prop_keys, graph_metadata=combined_metadata)
         data_set.index_split(data_idx_train=list(range(n_train)),
                              data_idx_valid=list(range(n_train, int(n_train+n_valid))),
                              data_idx_test=[],
                              r_cut=r_cut,
                              training=True,
-                             mic=mic)
+                             mic=mic,
+                             precomputed_graph=args.bond_aware)
     elif len(all_data) == 1:
         data = all_data[0]
-        data_set = DataSet(data=data, prop_keys=prop_keys)
+        # Pass adjacent metadata into the dataset validator when it is available.
+        combined_metadata = next((metadata for metadata in graph_metadata if metadata is not None), None)
+        data_set = DataSet(data=data, prop_keys=prop_keys, graph_metadata=combined_metadata)
         data_set.random_split(n_train=n_train,
                               n_valid=n_valid,
                               n_test=n_test,
                               r_cut=r_cut,
                               training=True,
                               mic=mic,
-                              seed=data_seed)
+                              seed=data_seed,
+                              precomputed_graph=args.bond_aware)
     else:
         raise RuntimeError('You should not end up here. Please file an issue :-)')
 
@@ -358,6 +398,9 @@ def train_so3krates():
 
     if args.so3krates_layer_kwargs is not None:
         so3krates_layer_kwargs.update(args.so3krates_layer_kwargs)
+
+    # Make the public flag authoritative even when a JSON kwargs dictionary also contains the field.
+    so3krates_layer_kwargs['bond_aware'] = args.bond_aware
 
     if args.zbl_repulsion:
         print('Running with ZBL repulsion.')

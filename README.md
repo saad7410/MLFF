@@ -148,6 +148,55 @@ train_so3krates --ckpt_dir second_module --data_file file.npz --n_train 1000 --n
 ``` 
 The above examples would assume that the properties `energy` and `force` are still found under the `keys` `E` and `F`,
 respectively but `position` and `atomic_type` are found under `pos` and `numbers`.
+
+### Bond-aware precomputed NPZ graphs
+
+Bond awareness is an opt-in SO3krates extension. It is nonperiodic in this first version and does not construct or infer
+bonds at runtime. A bond-aware run must use an NPZ containing the ordinary `R`, `z`, `E`, and `F` arrays plus an aligned,
+directed, padded graph:
+
+```text
+idx_i       (n_data, n_pairs)     integer receiver indices for edges i <- j
+idx_j       (n_data, n_pairs)     integer sender indices for edges i <- j
+pair_mask   (n_data, n_pairs)     1 for valid cutoff edges, 0 for padding
+bond_prob   (n_data, n_pairs, 4)  channels: single, aromatic, double, triple
+bond_mask   (n_data, n_pairs)     1 only when a valid edge has a bond annotation
+```
+
+Padded entries must have `idx_i = idx_j = -1`. `bond_mask` must be a subset of `pair_mask`; probabilities must be finite
+and nonnegative, and annotated rows must sum to one. The configured `r_cut` must be the cutoff used to create the graph.
+An adjacent `dataset.json` (or `dataset.npz.json`) may record this provenance and is validated when present:
+
+```json
+{
+  "r_cut": 5.0,
+  "bond_channels": ["single", "aromatic", "double", "triple"],
+  "bond_probability_tolerance": 1e-5
+}
+```
+
+Train a fresh bond-aware model with:
+
+```bash
+train_so3krates --bond_aware --data_file dataset.npz --n_train 1000 --n_valid 100 --r_cut 5.0
+```
+
+The JSON-driven Shnitsel workflow uses the same contract when `model.bond_aware` is true. In that mode `data.npz_path`
+replaces `data.nc_path`, the preprocessor is skipped, and an optional `state_index` selects the zero-based
+`target_state` array:
+
+```json
+{
+  "data": {"npz_path": "dataset.npz", "state_index": 0, "r_cut": 5.0},
+  "model": {"bond_aware": true, "features": 32, "n_layers": 3, "degree": 2, "n_heads": 4}
+}
+```
+
+Run the complete configuration with `python examples/train_so3krates_shnsl.py --config bond_aware.json`.
+
+Evaluation infers bond awareness from `hyperparameters.json` and therefore also requires a compatible NPZ graph. Old
+checkpoints remain ordinary SO3krates models; bond-aware runs do not support partial warm starts.
+
 ### Units
 Per default, `mlff` assumes the ASE default units which are `eV` for energy and `Angstrom` for coordinates. Some data
 sets, however, differ from these convention, e.g. the MD17 or the MD22 data set. You can download the corresponding 

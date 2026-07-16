@@ -17,6 +17,11 @@ total_spin = 'total_spin'
 idx_i = 'idx_i'
 idx_j = 'idx_j'
 
+# Expose precomputed edge masks and invariant bond descriptors as semantic properties.
+pair_mask = 'pair_mask'
+bond_prob = 'bond_prob'
+bond_mask = 'bond_mask'
+
 node_mask = 'node_mask'
 
 unit_cell = 'unit_cell'
