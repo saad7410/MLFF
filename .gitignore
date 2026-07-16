@@ -21,3 +21,5 @@ bin
 *module/
 archive/
 data
+.codex
+.venv
