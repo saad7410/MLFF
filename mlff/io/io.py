@@ -3,6 +3,8 @@ import pathlib
 import json
 from typing import (Dict, Sequence)
 
+import numpy as np
+
 
 def read_json(path: str) -> Dict:
     """
@@ -76,7 +78,17 @@ def save_dict(path, filename, data, exists_ok=False) -> None:
     path = create_directory(path, exists_ok=exists_ok)
     save_path = os.path.join(path, filename)
     with open(save_path, 'w') as f:
-        json.dump(data, f)
+        json.dump(data, f, default=_json_default)
+
+
+def _json_default(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pathlib.Path):
+        return value.as_posix()
+    raise TypeError(f'Object of type {value.__class__.__name__} is not JSON serializable')
 
 
 def bundle_dicts(x: Sequence[Dict]) -> Dict:

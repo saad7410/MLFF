@@ -24,3 +24,5 @@ data
 .codex
 .venv
 graphify-out/
+xshell_scripts_4_running/
+logs/
