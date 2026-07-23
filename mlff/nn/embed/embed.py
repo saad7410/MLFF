@@ -133,8 +133,9 @@ class GeometryEmbed(BaseSubModule):
         _cut_fn = get_cutoff_fn(self.radial_cutoff_fn)
         self.cut_fn = partial(_cut_fn, r_cut=self.r_cut)
 
-        # Store normalization constant for chi (SPHC embedding)
-        self._lambda = jnp.float32(self.sphc_normalization)
+        # The default `None` selects zero SPHC initialization, where the normalization is unused. Keep a finite
+        # placeholder so current JAX versions never attempt the invalid conversion `jnp.float32(None)`.
+        self._lambda = jnp.float32(1. if self.sphc_normalization is None else self.sphc_normalization)
 
     def __call__(self, inputs: Dict, *args, **kwargs):
         """

@@ -408,6 +408,45 @@ class DataSet:
         if not np.isclose(bonded_sums, 1.0, atol=probability_tolerance, rtol=0).all():
             raise ValueError('Bonded `bond_prob` rows must sum to one within the metadata tolerance.')
 
+        # Validate every supplied raw state descriptor against the same fixed edge graph. The model constructs
+        # relative 12-channel descriptors later; the persisted NPZ contract remains four probabilities per state.
+        state_descriptors = {}
+        for state in range(3):
+            prob_name = getattr(pn, f'bond_prob_s{state}')
+            mask_name = getattr(pn, f'bond_mask_s{state}')
+            prob_key = self.prop_keys.get(prob_name)
+            mask_key = self.prop_keys.get(mask_name)
+            prob_present = prob_key in self.data
+            mask_present = mask_key in self.data
+            if prob_present != mask_present:
+                raise ValueError(f'State {state} requires both `{prob_key}` and `{mask_key}`.')
+            if not prob_present:
+                continue
+
+            state_prob = np.asarray(self.data[prob_key])
+            state_mask = np.asarray(self.data[mask_key])
+            if state_prob.shape != (*idx_i.shape, 4):
+                raise ValueError(f'`{prob_key}` must have aligned shape (B, P, 4).')
+            if state_mask.shape != idx_i.shape:
+                raise ValueError(f'`{mask_key}` must have aligned shape (B, P).')
+            if not np.isin(state_mask, (0, 1)).all():
+                raise ValueError(f'`{mask_key}` must contain only 0/1 values.')
+
+            state_valid = state_mask.astype(bool)
+            if np.logical_and(state_valid, ~pair_valid).any():
+                raise ValueError(f'`{mask_key}` must be a subset of `pair_mask`.')
+            if not np.isfinite(state_prob).all() or (state_prob < 0).any():
+                raise ValueError(f'`{prob_key}` values must be finite and nonnegative.')
+            state_sums = state_prob.sum(axis=-1)[state_valid]
+            if not np.isclose(state_sums, 1.0, atol=probability_tolerance, rtol=0).all():
+                raise ValueError(f'Annotated `{prob_key}` rows must sum to one within the metadata tolerance.')
+            state_descriptors[state] = (state_prob, state_mask)
+
+        if 0 in state_descriptors:
+            state_0_prob, state_0_mask = state_descriptors[0]
+            if not np.array_equal(bond_prob, state_0_prob) or not np.array_equal(bond_mask, state_0_mask):
+                raise ValueError('Canonical `bond_prob`/`bond_mask` must be exact aliases of state-0 descriptors.')
+
     def random_split(self,
                      n_train,
                      n_valid,

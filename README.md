@@ -222,15 +222,42 @@ train_so3krates \
   --ckpt_dir delta_module
 ```
 
-The representation dimensions, layers, cutoff, MIC setting, and bond-awareness setting are reconstructed from
-`ground_module/hyperparameters.json`; the model arguments on the delta command do not redefine that backbone.
+The representation dimensions, layers, cutoff, and MIC setting are reconstructed from
+`ground_module/hyperparameters.json`; ordinary model arguments on the delta command do not redefine that backbone.
 All compatible representation parameters are loaded, while the shared state-conditioned delta head is initialized
-from the delta run's model seed. Add `--freeze_pretrained_backbone` to train only that new head.
+from the delta run's model seed. Add `--freeze_pretrained_backbone` to freeze the transferred parameter leaves.
 
 For a bond-aware ground checkpoint, delta mode is inferred automatically and the NPZ must also contain
 `bond_prob_s0/s1/s2` and `bond_mask_s0/s1/s2`, aligned with the same `idx_i`, `idx_j`, and `pair_mask`. The canonical
 `bond_prob` and `bond_mask` remain state-0 aliases. One shared SO3krates backbone is evaluated with the state-1 and
 state-2 descriptors, and one shared head distinguishes the electronic state through a learned embedding.
+
+An ordinary ground checkpoint can instead be upgraded with delta-only bond branches:
+
+```bash
+train_so3krates \
+  --delta \
+  --bond_aware \
+  --pretrained_ground_ckpt_dir ordinary_ground_module \
+  --data_file bond_delta_dataset.npz \
+  --n_train 1000 \
+  --n_valid 100 \
+  --ckpt_dir relative_bond_delta_module
+```
+
+This leaves the saved ground model unchanged. For every state `s` in `{1, 2}`, the delta wrapper masks the raw
+four-channel probabilities and constructs the 12-channel edge descriptor
+
+```text
+q_s = [b_0, b_s, b_s - b_0]
+```
+
+before the bond filter receives `[RBF(R_ij), q_s]`. Its gate is
+`pair_mask AND (bond_mask_s0 OR bond_mask_s)`, so unchanged bonds, bond-order changes, bond formation, and bond
+breaking are all represented. The final layers of the new bond branches start at zero, making the initial upgraded
+representation identical to the ordinary transferred backbone. With `--freeze_pretrained_backbone`, only the exact
+transferred leaves are frozen; the new bond branches, learned state embedding, and delta readout remain trainable.
+Old bond-aware checkpoints retain their legacy four-channel descriptor and parameter layout.
 
 Evaluate and reconstruct all three states with:
 

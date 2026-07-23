@@ -72,7 +72,12 @@ class StackNet(nn.Module):
         quantities.update(inputs)
 
         # Detect bond-aware layers from saved or newly constructed layer metadata.
-        bond_aware = any(getattr(layer, 'bond_aware', False) for layer in self.layers)
+        bond_layers = [layer for layer in self.layers if getattr(layer, 'bond_aware', False)]
+        bond_aware = bool(bond_layers)
+        bond_feature_dims = {int(getattr(layer, 'bond_feature_dim', 4)) for layer in bond_layers}
+        if len(bond_feature_dims) > 1:
+            raise ValueError('Every bond-aware SO3krates layer must use the same `bond_feature_dim`.')
+        bond_feature_dim = next(iter(bond_feature_dims), 4)
 
         # Canonicalize optional custom edge-property keys for the shared layer call convention.
         pair_mask_key = self.prop_keys.get(pn.pair_mask, pn.pair_mask)
@@ -95,8 +100,8 @@ class StackNet(nn.Module):
             bond_prob = inputs[bond_prob_key]
             bond_mask = inputs[bond_mask_key]
             pair_mask = quantities['pair_mask']
-            if bond_prob.ndim != 2 or bond_prob.shape != (pair_mask.shape[0], 4):
-                raise ValueError('`bond_prob` must have per-sample shape (P, 4).')
+            if bond_prob.ndim != 2 or bond_prob.shape != (pair_mask.shape[0], bond_feature_dim):
+                raise ValueError(f'`bond_prob` must have per-sample shape (P, {bond_feature_dim}).')
             if bond_mask.ndim != 1 or bond_mask.shape != pair_mask.shape:
                 raise ValueError('`bond_mask` must have per-sample shape (P,).')
 

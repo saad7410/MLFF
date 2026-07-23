@@ -27,7 +27,13 @@ from mlff.nn.stacknet import (get_obs_and_force_fn, get_observable_fn,
                               get_energy_force_stress_fn, get_delta_energy_force_fn,
                               init_stack_net)
 from mlff.nn import (So3krates, init_state_specific_delta_so3krates,
-                     load_pretrained_backbone)
+                     get_pretrained_backbone_paths, init_delta_model,
+                     load_pretrained_backbone, upgrade_stacknet_for_relative_bond_delta)
+from mlff.nn.representation.delta import (ABSOLUTE_BOND_DESCRIPTOR,
+                                          LEGACY_BOND_LAYOUT,
+                                          NAMED_BOND_LAYOUT,
+                                          RELATIVE_BOND_DESCRIPTOR,
+                                          RELATIVE_BOND_FEATURE_DIM)
 from mlff.nn.observable import Energy
 from mlff.data import AseDataLoader
 from mlff.properties import md17_property_keys
@@ -102,7 +108,8 @@ def train_so3krates():
     parser.add_argument('--pretrained_ground_ckpt_dir', type=str, required=False, default=None,
                         help='Ground-state SO3krates checkpoint used to initialize the shared delta backbone.')
     parser.add_argument('--freeze_pretrained_backbone', action='store_true', required=False,
-                        help='Freeze the transferred SO3krates representation and train only the delta head.')
+                        help='Freeze only transferred SO3krates parameters; newly added bond branches and the delta '
+                             'head remain trainable.')
 
     # Model Arguments
     parser.add_argument('--r_cut', type=float, required=False, default=5., help='Local neighborhood cutoff.')
@@ -202,10 +209,15 @@ def train_so3krates():
         prop_keys.setdefault(property_name, default_key)
 
     delta_learning = args.delta
-    pretrained_ground_ckpt_dir = args.pretrained_ground_ckpt_dir
-    if delta_learning and pretrained_ground_ckpt_dir is None and args.restart_from_ckpt_dir is not None:
-        # Resume delta runs from their saved ground-checkpoint reference when no override was supplied.
+    restart_h = None
+    if delta_learning and args.restart_from_ckpt_dir is not None:
         restart_h = read_json(Path(args.restart_from_ckpt_dir).absolute().resolve() / 'hyperparameters.json')
+        if 'delta_model' not in restart_h:
+            raise ValueError('A delta restart checkpoint must contain `delta_model` hyperparameters.')
+
+    pretrained_ground_ckpt_dir = args.pretrained_ground_ckpt_dir
+    if delta_learning and pretrained_ground_ckpt_dir is None and restart_h is not None:
+        # Resume delta runs from their saved ground-checkpoint reference when no override was supplied.
         pretrained_ground_ckpt_dir = restart_h.get('delta_model', {}).get('pretrained_ground_ckpt_dir')
     if delta_learning and pretrained_ground_ckpt_dir is None:
         raise ValueError('`--delta` requires `--pretrained_ground_ckpt_dir` for backbone initialization.')
@@ -216,11 +228,32 @@ def train_so3krates():
         pretrained_ground_ckpt_dir = Path(pretrained_ground_ckpt_dir).absolute().resolve().as_posix()
         ground_h = read_json(Path(pretrained_ground_ckpt_dir) / 'hyperparameters.json')
         ground_bond_aware = is_bond_aware_stacknet_metadata(ground_h)
-        if args.bond_aware and not ground_bond_aware:
-            raise ValueError('`--bond_aware` cannot be added to a non-bond-aware pretrained checkpoint.')
-        bond_aware = ground_bond_aware
+        if restart_h is not None:
+            # A restart always reconstructs its saved delta architecture. CLI flags may not mutate it in place.
+            saved_delta_backbone_h = {'stack_net': restart_h['delta_model']['backbone']}
+            bond_aware = is_bond_aware_stacknet_metadata(saved_delta_backbone_h)
+            if args.bond_aware and not bond_aware:
+                raise ValueError('`--bond_aware` cannot change the architecture of a non-bond-aware delta restart.')
+            bond_backbone_upgrade = restart_h['delta_model'].get('bond_backbone_upgrade', False)
+            bond_descriptor_mode = restart_h['delta_model'].get('bond_descriptor_mode',
+                                                                  ABSOLUTE_BOND_DESCRIPTOR)
+            bond_feature_dim = restart_h['delta_model'].get('bond_feature_dim', 4)
+            bond_parameter_layout = restart_h['delta_model'].get('bond_parameter_layout',
+                                                                  LEGACY_BOND_LAYOUT)
+        else:
+            # A non-bond ground checkpoint can be upgraded only inside the new delta model.
+            bond_backbone_upgrade = bool(args.bond_aware and not ground_bond_aware)
+            bond_aware = bool(ground_bond_aware or args.bond_aware)
+            bond_descriptor_mode = (RELATIVE_BOND_DESCRIPTOR
+                                    if bond_backbone_upgrade else ABSOLUTE_BOND_DESCRIPTOR)
+            bond_feature_dim = RELATIVE_BOND_FEATURE_DIM if bond_backbone_upgrade else 4
+            bond_parameter_layout = NAMED_BOND_LAYOUT if bond_backbone_upgrade else LEGACY_BOND_LAYOUT
     else:
         bond_aware = args.bond_aware
+        bond_backbone_upgrade = False
+        bond_descriptor_mode = ABSOLUTE_BOND_DESCRIPTOR
+        bond_feature_dim = 4
+        bond_parameter_layout = LEGACY_BOND_LAYOUT
 
     def parse_data_file(x):
         if x is not None:
@@ -398,12 +431,12 @@ def train_so3krates():
             cell_volumes = np.abs(np.linalg.det(cells))  # shape: (B)
             data[stress_key] = stress * cell_volumes[:, None, None]
 
-        if bond_aware:
-            # Keep only declared model inputs and targets before DataSet can reshape unrelated metadata.
-            data = select_data_for_model(data=data,
-                                         inputs=inputs,
-                                         targets=targets,
-                                         prop_keys=prop_keys)
+        # Keep only declared model inputs and targets before DataSet can reshape unrelated per-frame metadata.
+        # This is also important when an ordinary ground model consumes a graph-rich NPZ such as I02_s0.npz.
+        data = select_data_for_model(data=data,
+                                     inputs=inputs,
+                                     targets=targets,
+                                     prop_keys=prop_keys)
         all_data += [data]
 
     if len(all_data) == 2:
@@ -489,13 +522,25 @@ def train_so3krates():
         geometry_embed_kwargs.update(args.geometry_embed_kwargs)
 
     if delta_learning:
-        # Reuse the exact serialized SO3krates representation and attach only a new state-conditioned head.
-        ground_backbone = init_stack_net(ground_h)
-        ground_backbone.reset_prop_keys(prop_keys=prop_keys)
-        net = init_state_specific_delta_so3krates(
-            backbone=ground_backbone,
-            pretrained_ground_ckpt_dir=pretrained_ground_ckpt_dir,
-            freeze_pretrained_backbone=args.freeze_pretrained_backbone)
+        if restart_h is not None:
+            # Preserve the saved upgraded/legacy backbone layout and descriptor contract exactly.
+            net = init_delta_model(restart_h,
+                                   freeze_pretrained_backbone=args.freeze_pretrained_backbone)
+            net.reset_prop_keys(prop_keys=prop_keys)
+        else:
+            # Reuse the exact ground representation, optionally adding versioned relative-bond branches to its clone.
+            delta_backbone_h = (upgrade_stacknet_for_relative_bond_delta(ground_h)
+                                if bond_backbone_upgrade else ground_h)
+            delta_backbone = init_stack_net(delta_backbone_h)
+            delta_backbone.reset_prop_keys(prop_keys=prop_keys)
+            net = init_state_specific_delta_so3krates(
+                backbone=delta_backbone,
+                pretrained_ground_ckpt_dir=pretrained_ground_ckpt_dir,
+                freeze_pretrained_backbone=args.freeze_pretrained_backbone,
+                bond_backbone_upgrade=bond_backbone_upgrade,
+                bond_descriptor_mode=bond_descriptor_mode,
+                bond_feature_dim=bond_feature_dim,
+                bond_parameter_layout=bond_parameter_layout)
         obs_fn = get_delta_energy_force_fn(net)
     else:
         obs = [Energy(prop_keys=prop_keys, zbl_repulsion=args.zbl_repulsion)]
@@ -571,16 +616,6 @@ def train_so3krates():
                   training_seed=training_seed,
                   stop_lr_min=lr_stop)
 
-    frozen_param_paths = None
-    if delta_learning and args.freeze_pretrained_backbone:
-        # Stop gradients only through the transferred representation while leaving the new delta head trainable.
-        frozen_param_paths = (('params', 'backbone'),)
-    loss_fn = get_loss_fn(obs_fn=obs_fn,
-                          weights=effective_loss_weights,
-                          scales=scales,
-                          prop_keys=prop_keys,
-                          frozen_param_paths=frozen_param_paths)
-
     data_tuple = DataTuple(inputs=inputs,
                            targets=targets,
                            prop_keys=prop_keys)
@@ -589,15 +624,39 @@ def train_so3krates():
     valid_ds = data_tuple(d['valid'])
 
     inputs = jax.tree_util.tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
+    transferred_backbone_paths = ()
     if restart_from_ckpt_dir is None:
         # Initialize the complete delta tree first so its new state head receives independent random parameters.
         params = net.init(jax.random.PRNGKey(coach.net_seed), inputs)
         if delta_learning:
             ground_params = load_params_from_ckpt_dir(pretrained_ground_ckpt_dir)
-            params = load_pretrained_backbone(params, ground_params, strict=True)
+            params, transferred_backbone_paths = load_pretrained_backbone(
+                params,
+                ground_params,
+                strict=True,
+                allow_bond_upgrade=bond_backbone_upgrade,
+                return_transferred_paths=True)
     else:
         print(f"Restarting training from {restart_from_ckpt_dir}.")
         params = load_params_from_ckpt_dir(restart_from_ckpt_dir)
+        if delta_learning and args.freeze_pretrained_backbone:
+            ground_params = load_params_from_ckpt_dir(pretrained_ground_ckpt_dir)
+            transferred_backbone_paths = get_pretrained_backbone_paths(
+                delta_variables=params,
+                ground_variables=ground_params,
+                allow_bond_upgrade=bond_backbone_upgrade)
+
+    frozen_param_paths = None
+    if delta_learning and args.freeze_pretrained_backbone:
+        # Exact leaf paths freeze only the transferred representation. New bond branches and the head remain trainable.
+        frozen_param_paths = tuple(('params', 'backbone', *path) for path in transferred_backbone_paths)
+        if not frozen_param_paths:
+            raise ValueError('No transferred backbone parameter paths were found to freeze.')
+    loss_fn = get_loss_fn(obs_fn=obs_fn,
+                          weights=effective_loss_weights,
+                          scales=scales,
+                          prop_keys=prop_keys,
+                          frozen_param_paths=frozen_param_paths)
 
     train_state, h_train_state = create_train_state(net,
                                                     params,

@@ -1,8 +1,11 @@
 from .representation import (So3krates,
                              StateSpecificDeltaSo3krates,
+                             build_relative_bond_descriptor,
+                             get_pretrained_backbone_paths,
                              init_delta_model,
                              init_state_specific_delta_so3krates,
                              load_pretrained_backbone,
+                             upgrade_stacknet_for_relative_bond_delta,
                              So3kratACE,
                              SchNet)
 

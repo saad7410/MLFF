@@ -43,6 +43,8 @@ class So3kratesLayer(BaseSubModule):
     sphc_normalization: bool = False
     neighborhood_normalization: bool = False
     bond_aware: bool = False
+    bond_feature_dim: int = 4
+    bond_parameter_layout: str = 'legacy_auto'
     module_name: str = 'so3krates_layer'
 
     def setup(self):
@@ -58,6 +60,10 @@ class So3kratesLayer(BaseSubModule):
         if self.bond_aware and (self.fb_filter != 'radial_spherical' or self.gb_filter != 'radial_spherical'):
             raise ValueError('Bond-aware SO3krates requires both `fb_filter` and `gb_filter` to be '
                              '`radial_spherical`.')
+        if self.bond_feature_dim <= 0:
+            raise ValueError('`bond_feature_dim` must be positive.')
+        if self.bond_parameter_layout not in ('legacy_auto', 'named_v1'):
+            raise ValueError('`bond_parameter_layout` must be `legacy_auto` or `named_v1`.')
 
     @nn.compact
     def __call__(self,
@@ -118,7 +124,9 @@ class So3kratesLayer(BaseSubModule):
                                sph_filter_features=self.fb_sph_filter_features,
                                attention=self.fb_attention,
                                n_heads=self.n_heads,
-                               bond_aware=self.bond_aware)(x=x_pre_1,
+                               bond_aware=self.bond_aware,
+                               bond_feature_dim=self.bond_feature_dim,
+                               bond_parameter_layout=self.bond_parameter_layout)(x=x_pre_1,
                                                      rbf_ij=rbf_ij,
                                                      d_chi_ij_l=m_chi_ij,
                                                      phi_r_cut=phi_r_cut,
@@ -133,7 +141,9 @@ class So3kratesLayer(BaseSubModule):
                                    sph_filter_features=self.gb_sph_filter_features,
                                    attention=self.gb_attention,
                                    degrees=self.degrees,
-                                   bond_aware=self.bond_aware)(chi=chi,
+                                   bond_aware=self.bond_aware,
+                                   bond_feature_dim=self.bond_feature_dim,
+                                   bond_parameter_layout=self.bond_parameter_layout)(chi=chi,
                                                          sph_ij=sph_ij,
                                                          x=x_pre_1,
                                                          rbf_ij=rbf_ij,
@@ -214,6 +224,8 @@ class So3kratesLayer(BaseSubModule):
                                    'sphc_normalization': self.sphc_normalization,
                                    'neighborhood_normalization': self.neighborhood_normalization,
                                    'bond_aware': self.bond_aware,
+                                   'bond_feature_dim': self.bond_feature_dim,
+                                   'bond_parameter_layout': self.bond_parameter_layout,
                                    'final_layer': self.final_layer
                                    }
                 }
@@ -226,6 +238,8 @@ class FeatureBlock(nn.Module):
     attention: str  # TODO: depracated
     n_heads: int
     bond_aware: bool = False
+    bond_feature_dim: int = 4
+    bond_parameter_layout: str = 'legacy_auto'
 
     def setup(self):
         if self.filter == 'radial':
@@ -238,7 +252,9 @@ class FeatureBlock(nn.Module):
                                                    sph_n_heads=1,
                                                    sph_features=self.sph_filter_features,
                                                    activation_fn=silu,
-                                                   bond_aware=self.bond_aware)
+                                                   bond_aware=self.bond_aware,
+                                                   bond_feature_dim=self.bond_feature_dim,
+                                                   bond_parameter_layout=self.bond_parameter_layout)
         else:
             msg = "Filter argument `{}` is not a valid value.".format(self.filter)
             raise ValueError(msg)
@@ -296,6 +312,8 @@ class GeometricBlock(nn.Module):
     sph_filter_features: Sequence[int]
     attention: str  # TODO: depracated
     bond_aware: bool = False
+    bond_feature_dim: int = 4
+    bond_parameter_layout: str = 'legacy_auto'
 
     def setup(self):
         if self.filter == 'radial':
@@ -308,7 +326,9 @@ class GeometricBlock(nn.Module):
                                                    sph_n_heads=1,
                                                    sph_features=self.sph_filter_features,
                                                    activation_fn=silu,
-                                                   bond_aware=self.bond_aware)
+                                                   bond_aware=self.bond_aware,
+                                                   bond_feature_dim=self.bond_feature_dim,
+                                                   bond_parameter_layout=self.bond_parameter_layout)
         else:
             msg = "Filter argument `{}` is not a valid value.".format(self.filter)
             raise ValueError(msg)
@@ -454,10 +474,16 @@ class RadialSphericalFilter(nn.Module):
     sph_features: Sequence[int]
     activation_fn: Callable = silu
     bond_aware: bool = False
+    bond_feature_dim: int = 4
+    bond_parameter_layout: str = 'legacy_auto'
 
     def setup(self):
         assert self.rad_features[-1] % self.rad_n_heads == 0
         assert self.sph_features[-1] % self.sph_n_heads == 0
+        if self.bond_feature_dim <= 0:
+            raise ValueError('`bond_feature_dim` must be positive.')
+        if self.bond_parameter_layout not in ('legacy_auto', 'named_v1'):
+            raise ValueError('`bond_parameter_layout` must be `legacy_auto` or `named_v1`.')
 
         f_out_rad = int(self.rad_features[-1] / self.rad_n_heads)
         f_out_sph = int(self.sph_features[-1] / self.sph_n_heads)
@@ -508,14 +534,25 @@ class RadialSphericalFilter(nn.Module):
             if bond_prob is None or bond_mask is None or pair_mask is None:
                 raise ValueError('Bond-aware radial-spherical filters require `bond_prob`, `bond_mask`, and '
                                  '`pair_mask`.')
-            if bond_prob.ndim != rbf.ndim or bond_prob.shape[:-1] != rbf.shape[:-1] or bond_prob.shape[-1] != 4:
-                raise ValueError('`bond_prob` must have shape (..., P, 4) aligned with the radial edge dimension.')
+            if (bond_prob.ndim != rbf.ndim
+                    or bond_prob.shape[:-1] != rbf.shape[:-1]
+                    or bond_prob.shape[-1] != self.bond_feature_dim):
+                raise ValueError(f'`bond_prob` must have shape (..., P, {self.bond_feature_dim}) aligned with the '
+                                 'radial edge dimension.')
             if bond_mask.shape != rbf.shape[:-1] or pair_mask.shape != rbf.shape[:-1]:
                 raise ValueError('`bond_mask` and `pair_mask` must match the radial edge shape (..., P).')
 
-            # Condition the independent radial branch on geometry plus the four ordered bond channels.
+            # Condition the independent radial branch on geometry plus the configured bond descriptor channels.
             bond_features = jnp.concatenate([rbf, bond_prob], axis=-1)
-            bond_w = self.bond_rad_filter_fn(self._rad_features, self.activation_fn)(bond_features)
+            if self.bond_parameter_layout == 'named_v1':
+                # Only upgraded delta checkpoints use this explicit name. Legacy bond-aware checkpoints retain
+                # their historical auto-numbered Flax paths and reconstruct with `legacy_auto`.
+                bond_filter = self.bond_rad_filter_fn(self._rad_features,
+                                                      self.activation_fn,
+                                                      name='bond_rad_filter_fn')
+            else:
+                bond_filter = self.bond_rad_filter_fn(self._rad_features, self.activation_fn)
+            bond_w = bond_filter(bond_features)
 
             # Restrict the correction to chemically bonded, non-padded graph edges.
             bond_gate = jnp.logical_and(bond_mask.astype(bool), pair_mask.astype(bool))
