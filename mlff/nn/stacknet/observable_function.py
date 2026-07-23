@@ -149,6 +149,39 @@ def get_obs_and_force_fn(model: StackNet) -> ObservableFn:
     return obs_and_force_fn
 
 
+def get_delta_energy_force_fn(model: StackNet) -> ObservableFn:
+    """Create two delta-energy predictions and their coordinate-gradient force corrections."""
+    prop_keys = model.prop_keys
+    R_key = prop_keys['atomic_position']
+    delta_E1_key = prop_keys['delta_energy_1']
+    delta_E2_key = prop_keys['delta_energy_2']
+    delta_F1_key = prop_keys['delta_force_1']
+    delta_F2_key = prop_keys['delta_force_2']
+
+    def delta_energy_force_fn(p, x):
+        def delta_energies_with_outputs(R):
+            # Replace only coordinates so all graph, atom, and state-specific bond inputs remain shared.
+            positioned_inputs = dict(x)
+            positioned_inputs[R_key] = R
+            outputs = model.apply(p, positioned_inputs)
+
+            # Stack scalar corrections so one reverse-mode transform produces both coordinate Jacobians.
+            delta_energies = jnp.stack((outputs[delta_E1_key].reshape(()),
+                                        outputs[delta_E2_key].reshape(())))
+            return delta_energies, outputs
+
+        delta_jacobian, outputs = jax.jacrev(delta_energies_with_outputs,
+                                             has_aux=True)(x[R_key])
+
+        # Apply the force sign convention independently to both excited-state energy corrections.
+        outputs = dict(outputs)
+        outputs[delta_F1_key] = -delta_jacobian[0]
+        outputs[delta_F2_key] = -delta_jacobian[1]
+        return outputs
+
+    return delta_energy_force_fn
+
+
 def get_energy_force_stress_fn(model: StackNet):
     """
     Create an energy, force and stress function.

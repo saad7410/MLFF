@@ -30,6 +30,7 @@ setup(
     entry_points={
         "console_scripts": [
             "evaluate=mlff.cAPI.mlff_eval:evaluate",
+            "evaluate_delta=mlff.cAPI.delta_mlff_eval:evaluate_delta",
             "train=mlff.cAPI.mlff_train:train",
             "run_md=mlff.cAPI.mlff_md:run_md",
             "run_relaxation=mlff.cAPI.mlff_structure_relaxation:run_relaxation",

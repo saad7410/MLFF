@@ -55,6 +55,19 @@ class StackNet(nn.Module):
 
         """
 
+        # Build the shared representation once before applying each configured observable head.
+        quantities = self.forward_features(inputs)
+
+        observables = {}
+        for o_fn in self.observables:
+            o_dict = o_fn(quantities)
+            observables.update(o_dict)
+
+        # Return only model observables while keeping intermediate features private by default.
+        return observables
+
+    def forward_features(self, inputs) -> Dict[str, jnp.ndarray]:
+        """Return the final atomwise SO3krates quantities without applying observables."""
         quantities = {}
         quantities.update(inputs)
 
@@ -115,13 +128,8 @@ class StackNet(nn.Module):
             updated_quantities = layer(**quantities)
             quantities.update(updated_quantities)
 
-        observables = {}
-        for o_fn in self.observables:
-            o_dict = o_fn(quantities)
-            observables.update(o_dict)
-
-        # return jax.tree_map(lambda y: y[..., None], observables)
-        return observables
+        # Expose the final invariant and equivariant representation to composite SO3krates models.
+        return quantities
 
     def __dict_repr__(self):
         geometry_embeddings = [x.__dict_repr__() for x in self.geometry_embeddings]

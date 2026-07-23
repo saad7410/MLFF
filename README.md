@@ -195,7 +195,52 @@ replaces `data.nc_path`, the preprocessor is skipped, and an optional `state_ind
 Run the complete configuration with `python examples/train_so3krates_shnsl.py --config bond_aware.json`.
 
 Evaluation infers bond awareness from `hyperparameters.json` and therefore also requires a compatible NPZ graph. Old
-checkpoints remain ordinary SO3krates models; bond-aware runs do not support partial warm starts.
+checkpoints remain ordinary SO3krates models; ordinary bond-aware ground runs do not support restart warm starts.
+
+### Delta learning from a ground SO3krates checkpoint
+
+Delta mode learns two excited-state corrections relative to state 0:
+
+```text
+Delta_E1 = E1 - E0          Delta_F1 = F1 - F0 = -d(Delta_E1)/dR
+Delta_E2 = E2 - E0          Delta_F2 = F2 - F0 = -d(Delta_E2)/dR
+```
+
+The delta NPZ must contain `Delta_E1`, `Delta_E2`, `Delta_F1`, and `Delta_F2` in addition to the normal SO3krates
+inputs. Delta energies use shape `(n_data,)` or `(n_data, 1)` and delta forces use
+`(n_data, n_atoms, 3)`. Delta targets are kept in raw units and are not given the ground model's energy shift.
+
+Start delta training by supplying the completed ground checkpoint:
+
+```bash
+train_so3krates \
+  --delta \
+  --pretrained_ground_ckpt_dir ground_module \
+  --data_file delta_dataset.npz \
+  --n_train 1000 \
+  --n_valid 100 \
+  --ckpt_dir delta_module
+```
+
+The representation dimensions, layers, cutoff, MIC setting, and bond-awareness setting are reconstructed from
+`ground_module/hyperparameters.json`; the model arguments on the delta command do not redefine that backbone.
+All compatible representation parameters are loaded, while the shared state-conditioned delta head is initialized
+from the delta run's model seed. Add `--freeze_pretrained_backbone` to train only that new head.
+
+For a bond-aware ground checkpoint, delta mode is inferred automatically and the NPZ must also contain
+`bond_prob_s0/s1/s2` and `bond_mask_s0/s1/s2`, aligned with the same `idx_i`, `idx_j`, and `pair_mask`. The canonical
+`bond_prob` and `bond_mask` remain state-0 aliases. One shared SO3krates backbone is evaluated with the state-1 and
+state-2 descriptors, and one shared head distinguishes the electronic state through a learned embedding.
+
+Evaluate and reconstruct all three states with:
+
+```bash
+evaluate_delta --delta_ckpt_dir delta_module --apply_to delta_dataset.npz
+```
+
+The evaluator uses the ground checkpoint recorded by the delta run unless `--ground_ckpt_dir` overrides it. It first
+reverses the ground model's saved scale and energy shift, then reports MAE, RMSE, and R2 for `E0/E1/E2`, `F0/F1/F2`,
+and all four delta quantities. Results are written to `delta_metrics_on_test.json` and `delta_predictions.npz`.
 
 ### Units
 Per default, `mlff` assumes the ASE default units which are `eV` for energy and `Angstrom` for coordinates. Some data

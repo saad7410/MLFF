@@ -1,5 +1,5 @@
 from .observable import (get_observable_module,
                          Energy,
+                         StateDeltaHead,
                          ZBLRepulsion
                          )
-

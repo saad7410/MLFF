@@ -82,11 +82,12 @@ class DataSet:
         # get n_data, kind of messy but best way I could think of
         q_data = {k: v for k, v in self.data.items()}
 
-        # if energy exists in data, make sure it has the correct dimensions
-        try:
-            q_data[self.prop_keys[pn.energy]] = q_data[self.prop_keys[pn.energy]].reshape(-1, 1)
-        except KeyError:
-            pass
+        # Keep every structure-level energy target in the shared (B, 1) convention.
+        scalar_energy_properties = (pn.energy, pn.delta_energy_1, pn.delta_energy_2)
+        for property_name in scalar_energy_properties:
+            property_key = self.prop_keys.get(property_name)
+            if property_key in q_data:
+                q_data[property_key] = q_data[property_key].reshape(-1, 1)
 
         def reshape(y):
             if len(y.shape) <= 1:

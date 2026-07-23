@@ -18,12 +18,16 @@ from pathlib import Path
 from typing import Dict
 from ase.units import *
 
-from mlff.io import create_directory, bundle_dicts, save_dict, load_params_from_ckpt_dir
+from mlff.io import (create_directory, bundle_dicts, save_dict, read_json,
+                     load_params_from_ckpt_dir)
 from mlff.training import Coach, Optimizer, get_loss_fn, create_train_state
 from mlff.data import DataTuple, DataSet, load_precomputed_graph_metadata, select_data_for_model
 from mlff.cAPI.process_argparse import StoreDictKeyPair
-from mlff.nn.stacknet import get_obs_and_force_fn, get_observable_fn, get_energy_force_stress_fn
-from mlff.nn import So3krates
+from mlff.nn.stacknet import (get_obs_and_force_fn, get_observable_fn,
+                              get_energy_force_stress_fn, get_delta_energy_force_fn,
+                              init_stack_net)
+from mlff.nn import (So3krates, init_state_specific_delta_so3krates,
+                     load_pretrained_backbone)
 from mlff.nn.observable import Energy
 from mlff.data import AseDataLoader
 from mlff.properties import md17_property_keys
@@ -51,6 +55,12 @@ def unit_convert_data(x: Dict, table: Dict):
             logging.info('Converted {} to ase default unit.'.format(k))
             x[k] *= table[k]
     return x
+
+
+def is_bond_aware_stacknet_metadata(h: Dict) -> bool:
+    # Infer representation compatibility from serialized layers so delta mode cannot drift from its checkpoint.
+    return any(layer_h.get('so3krates_layer', {}).get('bond_aware', False)
+               for layer_h in h['stack_net']['layers'])
 
 
 def train_so3krates():
@@ -86,6 +96,13 @@ def train_so3krates():
     parser.add_argument('--restart_from_ckpt_dir', type=str, required=False, default=None,
                         help='Path to a checkpoint directory from which to load model parameters and start the '
                              'training.')
+
+    parser.add_argument('--delta', action='store_true', required=False,
+                        help='Train state-1/state-2 energy and force corrections from a ground SO3krates checkpoint.')
+    parser.add_argument('--pretrained_ground_ckpt_dir', type=str, required=False, default=None,
+                        help='Ground-state SO3krates checkpoint used to initialize the shared delta backbone.')
+    parser.add_argument('--freeze_pretrained_backbone', action='store_true', required=False,
+                        help='Freeze the transferred SO3krates representation and train only the delta head.')
 
     # Model Arguments
     parser.add_argument('--r_cut', type=float, required=False, default=5., help='Local neighborhood cutoff.')
@@ -154,7 +171,14 @@ def train_so3krates():
 
     parser.add_argument('--clip_by_global_norm', type=float, required=False, default=None)
 
-    default_loss_weights = {pn.energy: 0.01, pn.force: 0.99, pn.stress: 0.01}
+    # Split the established energy/force weighting evenly across the two delta states.
+    default_loss_weights = {pn.energy: 0.01,
+                            pn.force: 0.99,
+                            pn.stress: 0.01,
+                            pn.delta_energy_1: 0.005,
+                            pn.delta_energy_2: 0.005,
+                            pn.delta_force_1: 0.495,
+                            pn.delta_force_2: 0.495}
     parser.add_argument('--loss_weights', action=StoreDictKeyPair, required=False, default=default_loss_weights)
     parser.add_argument("--loss_variance_scaling", action="store_true",
                         help="Scale the individual loss terms by the inverse of their variance in the training split. "
@@ -172,11 +196,31 @@ def train_so3krates():
 
     args = parser.parse_args()
 
-    # Copy parser defaults before adding opt-in bond properties to avoid mutating the shared mapping.
+    # Copy parser defaults before adding opt-in delta and bond properties to avoid mutating the shared mapping.
     prop_keys = dict(args.prop_keys)
-    prop_keys.setdefault(pn.pair_mask, pn.pair_mask)
-    prop_keys.setdefault(pn.bond_prob, pn.bond_prob)
-    prop_keys.setdefault(pn.bond_mask, pn.bond_mask)
+    for property_name, default_key in md17_property_keys.items():
+        prop_keys.setdefault(property_name, default_key)
+
+    delta_learning = args.delta
+    pretrained_ground_ckpt_dir = args.pretrained_ground_ckpt_dir
+    if delta_learning and pretrained_ground_ckpt_dir is None and args.restart_from_ckpt_dir is not None:
+        # Resume delta runs from their saved ground-checkpoint reference when no override was supplied.
+        restart_h = read_json(Path(args.restart_from_ckpt_dir).absolute().resolve() / 'hyperparameters.json')
+        pretrained_ground_ckpt_dir = restart_h.get('delta_model', {}).get('pretrained_ground_ckpt_dir')
+    if delta_learning and pretrained_ground_ckpt_dir is None:
+        raise ValueError('`--delta` requires `--pretrained_ground_ckpt_dir` for backbone initialization.')
+
+    ground_h = None
+    if delta_learning:
+        # Reconstruct architecture from the ground checkpoint instead of duplicating its dimensions in CLI flags.
+        pretrained_ground_ckpt_dir = Path(pretrained_ground_ckpt_dir).absolute().resolve().as_posix()
+        ground_h = read_json(Path(pretrained_ground_ckpt_dir) / 'hyperparameters.json')
+        ground_bond_aware = is_bond_aware_stacknet_metadata(ground_h)
+        if args.bond_aware and not ground_bond_aware:
+            raise ValueError('`--bond_aware` cannot be added to a non-bond-aware pretrained checkpoint.')
+        bond_aware = ground_bond_aware
+    else:
+        bond_aware = args.bond_aware
 
     def parse_data_file(x):
         if x is not None:
@@ -196,14 +240,14 @@ def train_so3krates():
     else:
         data_files = [data_file]
 
-    if args.bond_aware:
+    if bond_aware:
         # The first bond-aware port consumes only nonperiodic NPZ files with a fixed graph.
         non_npz_files = [path for path in data_files if Path(path).suffix != '.npz']
         if non_npz_files:
             raise ValueError('`--bond_aware` accepts only NPZ input files with precomputed graph arrays.')
         if args.mic:
             raise ValueError('`--bond_aware` currently supports only nonperiodic precomputed graphs.')
-        if args.restart_from_ckpt_dir is not None:
+        if args.restart_from_ckpt_dir is not None and not delta_learning:
             raise ValueError('Bond-aware SO3krates models must be trained from fresh initialization.')
 
     shift_by = args.shift_by
@@ -230,7 +274,21 @@ def train_so3krates():
         from jax import config
         config.update("jax_enable_x64", True)
 
-    r_cut = args.r_cut
+    if delta_learning:
+        # Use checkpoint geometry settings for both neighbor validation and the transferred representation.
+        ground_geometry_h = next(
+            embedding_h['geometry_embed']
+            for embedding_h in ground_h['stack_net']['geometry_embeddings']
+            if 'geometry_embed' in embedding_h)
+        r_cut = float(ground_geometry_h['r_cut'])
+        mic = bool(ground_geometry_h.get('mic', False))
+    else:
+        r_cut = args.r_cut
+        mic = args.mic
+
+    if bond_aware and mic:
+        raise ValueError('Bond-aware delta learning currently supports only nonperiodic pretrained checkpoints.')
+
     F = args.F
     L = args.L
     degrees = args.degrees
@@ -253,23 +311,40 @@ def train_so3krates():
     lr_stop = args.lr_stop
 
     inputs = list(args.inputs)
-    targets = args.targets
+    targets = list(args.targets)
+    if delta_learning:
+        # Delta optimization always supervises both energy and gradient-derived force corrections.
+        targets = [pn.delta_energy_1, pn.delta_energy_2,
+                   pn.delta_force_1, pn.delta_force_2]
 
-    if args.bond_aware:
+    if bond_aware:
         # Ensure Coach/DataTuple preserve the fixed edge mask and both bond descriptor tensors.
         for bond_input in (pn.pair_mask, pn.bond_prob, pn.bond_mask):
             if bond_input not in inputs:
                 inputs.append(bond_input)
 
-    mic = args.mic
+    if delta_learning and bond_aware:
+        # Preserve every state descriptor needed for the two shared-backbone passes and later ground reconstruction.
+        state_bond_inputs = (pn.bond_prob_s0, pn.bond_mask_s0,
+                             pn.bond_prob_s1, pn.bond_mask_s1,
+                             pn.bond_prob_s2, pn.bond_mask_s2)
+        for state_bond_input in state_bond_inputs:
+            if state_bond_input not in inputs:
+                inputs.append(state_bond_input)
+
     if mic:
         inputs += [pn.unit_cell]
         inputs += [pn.cell_offset]
 
     _loss_weights = args.loss_weights
+    missing_loss_weights = [target for target in targets if target not in _loss_weights]
+    if missing_loss_weights:
+        raise ValueError(f'No loss weights were provided for targets {missing_loss_weights}.')
     loss_weights = {k: float(v) for (k, v) in _loss_weights.items() if k in targets}
 
     total_loss_weight = sum([x for x in loss_weights.values()])
+    if total_loss_weight <= 0:
+        raise ValueError('The selected loss weights must sum to a positive value.')
     effective_loss_weights = {k: v / total_loss_weight for k, v in loss_weights.items()}
 
     n_train = args.n_train
@@ -299,7 +374,7 @@ def train_so3krates():
         if extension == '.npz':
             # Disable object loading so the graph contract remains numeric and inspectable.
             data = dict(np.load(d, allow_pickle=False))
-            if args.bond_aware:
+            if bond_aware:
                 graph_metadata.append(load_precomputed_graph_metadata(d, r_cut=r_cut))
         else:
             load_stress = pn.stress in targets
@@ -323,7 +398,7 @@ def train_so3krates():
             cell_volumes = np.abs(np.linalg.det(cells))  # shape: (B)
             data[stress_key] = stress * cell_volumes[:, None, None]
 
-        if args.bond_aware:
+        if bond_aware:
             # Keep only declared model inputs and targets before DataSet can reshape unrelated metadata.
             data = select_data_for_model(data=data,
                                          inputs=inputs,
@@ -346,7 +421,7 @@ def train_so3krates():
                              r_cut=r_cut,
                              training=True,
                              mic=mic,
-                             precomputed_graph=args.bond_aware)
+                             precomputed_graph=bond_aware)
     elif len(all_data) == 1:
         data = all_data[0]
         # Pass adjacent metadata into the dataset validator when it is available.
@@ -359,16 +434,18 @@ def train_so3krates():
                               training=True,
                               mic=mic,
                               seed=data_seed,
-                              precomputed_graph=args.bond_aware)
+                              precomputed_graph=bond_aware)
     else:
         raise RuntimeError('You should not end up here. Please file an issue :-)')
 
-    if shift_by == 'mean':
-        data_set.shift_x_by_mean_x(x=pn.energy)
-    elif shift_by == 'atomic_number':
-        data_set.shift_x_by_type(x=pn.energy, shifts=shifts)
-    elif shift_by == 'lse':
-        data_set.shift_x_by_type(x=pn.energy)
+    if not delta_learning:
+        # Ground-state training retains its existing energy-shift behavior.
+        if shift_by == 'mean':
+            data_set.shift_x_by_mean_x(x=pn.energy)
+        elif shift_by == 'atomic_number':
+            data_set.shift_x_by_type(x=pn.energy, shifts=shifts)
+        elif shift_by == 'lse':
+            data_set.shift_x_by_type(x=pn.energy)
 
     d = data_set.get_data_split()
 
@@ -377,17 +454,15 @@ def train_so3krates():
         for t in targets:
             if t == pn.stress:
                 scales[prop_keys[t]] = 1 / np.nanvar(d['train'][prop_keys[t]], axis=0)
-            elif t == pn.energy:
+            elif t in (pn.energy, pn.delta_energy_1, pn.delta_energy_2):
                 scales[prop_keys[t]] = 1 / np.nanvar(d['train'][prop_keys[t]])
-            elif t == pn.force:
+            elif t in (pn.force, pn.delta_force_1, pn.delta_force_2):
                 force_data_train = d['train'][prop_keys[t]]
                 node_msk_train = d['train'][prop_keys[pn.node_mask]]
-                print(force_data_train.shape)
-                print(node_msk_train.shape)
                 scales[prop_keys[t]] = 1 / np.nanvar(force_data_train[node_msk_train])
             else:
                 raise NotImplementedError('Loss with variance scaling currently only implemented for loss with '
-                                          'energy and/or forces and/or stress.')
+                                          'energy, delta energy, forces, delta forces, and/or stress.')
     else:
         scales = None
 
@@ -400,8 +475,10 @@ def train_so3krates():
         so3krates_layer_kwargs.update(args.so3krates_layer_kwargs)
 
     # Make the public flag authoritative even when a JSON kwargs dictionary also contains the field.
-    so3krates_layer_kwargs['bond_aware'] = args.bond_aware
+    so3krates_layer_kwargs['bond_aware'] = bond_aware
 
+    if delta_learning and args.zbl_repulsion:
+        raise ValueError('ZBL repulsion belongs to the ground energy head and is not a delta-head option.')
     if args.zbl_repulsion:
         print('Running with ZBL repulsion.')
 
@@ -411,20 +488,30 @@ def train_so3krates():
     if args.geometry_embed_kwargs is not None:
         geometry_embed_kwargs.update(args.geometry_embed_kwargs)
 
-    obs = [Energy(prop_keys=prop_keys, zbl_repulsion=args.zbl_repulsion)]
-    net = So3krates(prop_keys=prop_keys,
-                    F=F,
-                    n_layer=L,
-                    obs=obs,
-                    geometry_embed_kwargs=geometry_embed_kwargs,
-                    so3krates_layer_kwargs=so3krates_layer_kwargs)
+    if delta_learning:
+        # Reuse the exact serialized SO3krates representation and attach only a new state-conditioned head.
+        ground_backbone = init_stack_net(ground_h)
+        ground_backbone.reset_prop_keys(prop_keys=prop_keys)
+        net = init_state_specific_delta_so3krates(
+            backbone=ground_backbone,
+            pretrained_ground_ckpt_dir=pretrained_ground_ckpt_dir,
+            freeze_pretrained_backbone=args.freeze_pretrained_backbone)
+        obs_fn = get_delta_energy_force_fn(net)
+    else:
+        obs = [Energy(prop_keys=prop_keys, zbl_repulsion=args.zbl_repulsion)]
+        net = So3krates(prop_keys=prop_keys,
+                        F=F,
+                        n_layer=L,
+                        obs=obs,
+                        geometry_embed_kwargs=geometry_embed_kwargs,
+                        so3krates_layer_kwargs=so3krates_layer_kwargs)
 
-    if pn.force in targets:
+    if not delta_learning and pn.force in targets:
         if pn.stress in targets:
             obs_fn = get_energy_force_stress_fn(net)
         else:
             obs_fn = get_obs_and_force_fn(net)
-    else:
+    elif not delta_learning:
         obs_fn = get_observable_fn(net)
 
     obs_fn = jax.vmap(obs_fn, in_axes=(None, 0))
@@ -484,10 +571,15 @@ def train_so3krates():
                   training_seed=training_seed,
                   stop_lr_min=lr_stop)
 
+    frozen_param_paths = None
+    if delta_learning and args.freeze_pretrained_backbone:
+        # Stop gradients only through the transferred representation while leaving the new delta head trainable.
+        frozen_param_paths = (('params', 'backbone'),)
     loss_fn = get_loss_fn(obs_fn=obs_fn,
                           weights=effective_loss_weights,
                           scales=scales,
-                          prop_keys=prop_keys)
+                          prop_keys=prop_keys,
+                          frozen_param_paths=frozen_param_paths)
 
     data_tuple = DataTuple(inputs=inputs,
                            targets=targets,
@@ -498,7 +590,11 @@ def train_so3krates():
 
     inputs = jax.tree_util.tree_map(lambda x: jnp.array(x[0, ...]), train_ds[0])
     if restart_from_ckpt_dir is None:
+        # Initialize the complete delta tree first so its new state head receives independent random parameters.
         params = net.init(jax.random.PRNGKey(coach.net_seed), inputs)
+        if delta_learning:
+            ground_params = load_params_from_ckpt_dir(pretrained_ground_ckpt_dir)
+            params = load_pretrained_backbone(params, ground_params, strict=True)
     else:
         print(f"Restarting training from {restart_from_ckpt_dir}.")
         params = load_params_from_ckpt_dir(restart_from_ckpt_dir)
