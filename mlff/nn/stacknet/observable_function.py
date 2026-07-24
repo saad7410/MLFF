@@ -4,6 +4,7 @@ import logging
 
 from typing import (Any, Callable, Dict, Sequence, Tuple)
 from flax.core.frozen_dict import FrozenDict
+from mlff.properties import property_names as pn
 
 # logging.basicConfig(level=logging.INFO)
 
@@ -180,6 +181,29 @@ def get_delta_energy_force_fn(model: StackNet) -> ObservableFn:
         return outputs
 
     return delta_energy_force_fn
+
+
+def get_delta_offset_energy_force_fn(model: StackNet) -> ObservableFn:
+    """Create one routed offset energy and its negative coordinate gradient."""
+    prop_keys = model.prop_keys
+    R_key = prop_keys[pn.atomic_position]
+    offset_E_key = prop_keys[pn.offset_energy]
+    offset_F_key = prop_keys[pn.offset_force]
+
+    def delta_offset_energy_force_fn(p, x):
+        def offset_energy_with_outputs(R):
+            positioned_inputs = dict(x)
+            positioned_inputs[R_key] = R
+            outputs = model.apply(p, positioned_inputs)
+            return outputs[offset_E_key].reshape(()), outputs
+
+        (_, outputs), offset_gradient = jax.value_and_grad(
+            offset_energy_with_outputs, has_aux=True)(x[R_key])
+        outputs = dict(outputs)
+        outputs[offset_F_key] = -offset_gradient
+        return outputs
+
+    return delta_offset_energy_force_fn
 
 
 def get_energy_force_stress_fn(model: StackNet):

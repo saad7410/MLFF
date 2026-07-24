@@ -50,3 +50,13 @@ qm7x_property_keys = {energy: 'ePBE0+MBD',
                       bond_mask_s2: 'bond_mask_s2',
                       node_mask: 'node_mask'
                       }
+
+# Delta-offset-only mappings are merged explicitly by its trainer. Keeping them
+# separate preserves legacy ground/standard-delta prop_keys and scales metadata.
+delta_offset_property_keys = {
+    offset_energy: 'Offset_E',
+    offset_force: 'Offset_F',
+    pred_energy_0: 'pred_E0',
+    pred_force_0: 'pred_F0',
+    active_state: 'astate',
+}

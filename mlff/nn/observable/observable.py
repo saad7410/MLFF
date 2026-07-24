@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import flax.linen as nn
+import numbers
 
 from jax.ops import segment_sum
 from jax.nn.initializers import constant
@@ -119,13 +120,16 @@ class StateDeltaHead(BaseSubModule):
 
     @nn.compact
     def __call__(self, inputs: Dict, state: int, *args, **kwargs):
-        if state < 0 or state >= self.n_states:
+        # Preserve eager validation for the standard two-output delta path while
+        # also accepting a traced per-sample state in routed offset models.
+        if isinstance(state, numbers.Integral) and (state < 0 or state >= self.n_states):
             raise ValueError(f'State index {state} is outside configured range 0..{self.n_states - 1}.')
 
         x = inputs['x']
         point_mask = inputs['point_mask']
 
         # Condition every atom feature on the requested electronic state with one shared embedding table.
+        state = jnp.asarray(state, dtype=jnp.int32).reshape(())
         state_ids = jnp.full((x.shape[0],), state, dtype=jnp.int32)
         state_features = nn.Embed(num_embeddings=self.n_states,
                                   features=self.feature_dim,

@@ -83,11 +83,19 @@ class DataSet:
         q_data = {k: v for k, v in self.data.items()}
 
         # Keep every structure-level energy target in the shared (B, 1) convention.
-        scalar_energy_properties = (pn.energy, pn.delta_energy_1, pn.delta_energy_2)
+        scalar_energy_properties = (pn.energy, pn.delta_energy_1, pn.delta_energy_2,
+                                    pn.offset_energy, pn.pred_energy_0)
         for property_name in scalar_energy_properties:
             property_key = self.prop_keys.get(property_name)
             if property_key in q_data:
                 q_data[property_key] = q_data[property_key].reshape(-1, 1)
+
+        # Electronic-state labels are structure scalars, not shared metadata. Keeping
+        # them in (B, 1) form prevents the generic one-dimensional correction below
+        # from treating a length-B state vector as one structure with B features.
+        active_state_key = self.prop_keys.get(pn.active_state)
+        if active_state_key in q_data:
+            q_data[active_state_key] = q_data[active_state_key].reshape(-1, 1)
 
         def reshape(y):
             if len(y.shape) <= 1:
