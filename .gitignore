@@ -21,8 +21,8 @@ bin
 *module/
 archive/
 data
-.codex
 .venv
-graphify-out/
 xshell_scripts_4_running/
 logs/
+examples/visualization/
+examples/example_data/

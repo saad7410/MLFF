@@ -98,6 +98,8 @@ class So3kratesLayer(BaseSubModule):
         Returns:
 
         """
+        replace = lambda _, value: value
+        self.sow('record', 'x_in', x, reduce_fn=replace)
         self.sow('record', 'chi_in', chi)
 
         chi_ij = safe_scale(jax.vmap(lambda i, j: chi[j] - chi[i])(idx_i, idx_j),
@@ -197,6 +199,7 @@ class So3kratesLayer(BaseSubModule):
             else:
                 x_skip_2 = x_skip_2
 
+        self.sow('record', 'x_out', x_skip_2, reduce_fn=replace)
         self.sow('record', 'chi_out', chi_skip_2)
 
         return {'x': x_skip_2, 'chi': chi_skip_2}
@@ -527,7 +530,8 @@ class RadialSphericalFilter(nn.Module):
         Returns: filter values, shape: (...,F)
 
         """
-        w = self.rad_filter_fn(self._rad_features, self.activation_fn)(rbf)  # shape: (...,n_heads,F_head)
+        w_rad = self.rad_filter_fn(self._rad_features, self.activation_fn)(rbf)  # (...,n_heads,F_head)
+        w_bond = jnp.zeros_like(w_rad)
 
         if self.bond_aware:
             # Reject missing or malformed descriptors before Flax traces a misleading dense-layer error.
@@ -552,16 +556,27 @@ class RadialSphericalFilter(nn.Module):
                                                       name='bond_rad_filter_fn')
             else:
                 bond_filter = self.bond_rad_filter_fn(self._rad_features, self.activation_fn)
-            bond_w = bond_filter(bond_features)
+            raw_bond_w = bond_filter(bond_features)
 
             # Restrict the correction to chemically bonded, non-padded graph edges.
             bond_gate = jnp.logical_and(bond_mask.astype(bool), pair_mask.astype(bool))
-            w += safe_scale(bond_w, scale=bond_gate[..., None, None])
+            w_bond = safe_scale(raw_bond_w, scale=bond_gate[..., None, None])
 
         # Preserve the existing spherical contribution for both legacy and bond-aware filters.
-        w += self.sph_filter_fn(self._sph_features, self.activation_fn)(d_gamma)  # shape: (...,n_heads,F_head)
-        w = w.reshape(*rbf.shape[:-1], -1)  # shape: (...,n,n,F)
-        return w
+        w_sph = self.sph_filter_fn(self._sph_features, self.activation_fn)(d_gamma)
+        w_total = w_rad + w_bond + w_sph
+
+        # Analysis-only captures. The conventional ``intermediates`` collection is absent
+        # unless callers explicitly request it with ``mutable=['intermediates']``. Replacing
+        # the previous value avoids Flax's default tuple accumulation during repeated calls.
+        flatten_heads = lambda value: value.reshape(*rbf.shape[:-1], -1)
+        replace = lambda _, value: value
+        self.sow('intermediates', 'w_rad', flatten_heads(w_rad), reduce_fn=replace)
+        self.sow('intermediates', 'w_sph', flatten_heads(w_sph), reduce_fn=replace)
+        self.sow('intermediates', 'w_bond', flatten_heads(w_bond), reduce_fn=replace)
+        self.sow('intermediates', 'w_total', flatten_heads(w_total), reduce_fn=replace)
+
+        return flatten_heads(w_total)
 
 
 class ConvAttention(nn.Module):

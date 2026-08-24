@@ -1,0 +1,13 @@
+2                                        #Type of calculation: 
+                                         #Frequency calculation? [True] 
+../../inputs/geom.xyz                    #Geometry filename: [geom.xyz] (autocomplete enabled) 
+1                                        #Charge: [0] 
+1                                        #Level of theory: 
+cc-pvdz                                  #Basis set: 
+                                         #Use Cholesky decomposition? [False] 
+no                                       #Douglas-Kroll scalar-relativistic integrals? [True] 
+6                                        #Number of active electrons: 
+4                                        #Number of active orbitals: 
+3                                        #Number of states: [0 0 0 0 0 0 0 0] 
+                                         #Root: [1 1] 
+no                                       #Runscript? [True] 

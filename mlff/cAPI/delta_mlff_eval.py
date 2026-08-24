@@ -19,6 +19,7 @@ from mlff.data import (DataSet, DataTuple, load_precomputed_graph_metadata,
 from mlff.inference.evaluation import evaluate_model, mae_metric, rmse_metric, r2_metric
 from mlff.io import load_params_from_ckpt_dir, read_json
 from mlff.nn import init_delta_model
+from mlff.nn.representation.delta import ground_teacher_inputs
 from mlff.nn.stacknet import get_delta_energy_force_fn, get_obs_and_force_fn, init_stack_net
 from mlff.properties import property_names as pn
 from mlff.training import Coach
@@ -208,6 +209,7 @@ def evaluate_delta():
 
     delta_stack_h = delta_h['delta_model']['backbone']
     bond_aware = is_bond_aware_stacknet_metadata({'stack_net': delta_stack_h})
+    ground_bond_aware = is_bond_aware_stacknet_metadata(ground_h)
     r_cut, mic = _geometry_settings(delta_stack_h)
     if bond_aware and mic:
         raise ValueError('Bond-aware delta evaluation currently supports only nonperiodic checkpoints.')
@@ -265,7 +267,9 @@ def evaluate_delta():
 
     def combined_obs_fn(params, batch_inputs):
         ground_variables, delta_variables = params
-        ground_outputs = ground_obs_fn(ground_variables, batch_inputs)
+        ground_outputs = ground_obs_fn(
+            ground_variables,
+            ground_teacher_inputs(batch_inputs, prop_keys, ground_bond_aware))
         delta_outputs = delta_obs_fn(delta_variables, batch_inputs)
         energy_0, force_0 = _restore_ground_units(ground_outputs,
                                                   batch_inputs,

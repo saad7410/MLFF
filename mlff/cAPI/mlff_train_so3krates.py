@@ -43,7 +43,8 @@ from mlff.nn.representation.delta import (ABSOLUTE_BOND_DESCRIPTOR,
                                           NAMED_BOND_LAYOUT,
                                           OFFSET_SIGN_CONVENTION,
                                           RELATIVE_BOND_DESCRIPTOR,
-                                          RELATIVE_BOND_FEATURE_DIM)
+                                          RELATIVE_BOND_FEATURE_DIM,
+                                          ground_teacher_inputs)
 from mlff.nn.observable import Energy
 from mlff.data import AseDataLoader
 from mlff.properties import delta_offset_property_keys, md17_property_keys
@@ -154,13 +155,13 @@ def validate_and_filter_delta_offset_data(data: Dict, prop_keys: Dict):
 
 
 def inspect_delta_offset_files(data_files, prop_keys):
-    """Inspect only numeric arrays needed to choose the routed offset contract."""
+    """Validate the canonical bond-conditioned offset schema and collect states."""
     state_ids = set()
-    relative_available = True
-    absolute_available = True
     state_key = prop_keys[pn.active_state]
     core_keys = tuple(prop_keys[name] for name in
-                      (pn.atomic_position, pn.atomic_type, pn.energy, pn.force, pn.active_state))
+                      (pn.atomic_position, pn.atomic_type, pn.energy, pn.force,
+                       pn.active_state, pn.idx_i, pn.idx_j, pn.pair_mask,
+                       pn.bond_prob, pn.bond_mask))
 
     for path in data_files:
         if Path(path).suffix != '.npz':
@@ -182,15 +183,17 @@ def inspect_delta_offset_files(data_files, prop_keys):
             if not file_state_ids:
                 raise ValueError(f'Delta-offset file {path} contains no S1/S2 rows.')
             state_ids.update(file_state_ids)
+    return tuple(sorted(state_ids))
 
-            absolute_keys = (prop_keys[pn.bond_prob], prop_keys[pn.bond_mask])
-            absolute_available &= all(key in available for key in absolute_keys)
-            relative_keys = [prop_keys[pn.bond_prob_s0], prop_keys[pn.bond_mask_s0]]
-            for state in file_state_ids:
-                relative_keys.extend((prop_keys[getattr(pn, f'bond_prob_s{state}')],
-                                      prop_keys[getattr(pn, f'bond_mask_s{state}')]))
-            relative_available &= all(key in available for key in relative_keys)
-    return tuple(sorted(state_ids)), relative_available, absolute_available
+
+def ground_bond_descriptors_available(data_files, prop_keys):
+    """Return whether every offset source contains S0 teacher descriptors."""
+    required = (prop_keys[pn.bond_prob_s0], prop_keys[pn.bond_mask_s0])
+    for path in data_files:
+        with np.load(path, allow_pickle=False) as archive:
+            if not all(key in archive.files for key in required):
+                return False
+    return True
 
 
 def _geometry_group_ids(archive, prop_keys):
@@ -285,34 +288,25 @@ def generate_grouped_split_indices(group_ids, n_train, n_valid, n_test=None, see
     return rows_for(train_groups), rows_for(valid_groups), rows_for(test_groups)
 
 
-def load_delta_offset_npz(path, inputs, prop_keys, conversion_table,
-                          bond_descriptor_mode=ABSOLUTE_BOND_DESCRIPTOR):
+def load_delta_offset_npz(path, inputs, prop_keys, conversion_table):
     """Load only required numeric arrays, leaving object provenance untouched."""
     properties = tuple(dict.fromkeys((*inputs, pn.energy, pn.force, pn.active_state)))
-    generated = {pn.idx_i, pn.idx_j, pn.node_mask, pn.cell_offset}
+    # Only the atom mask may be derived for the mandatory nonperiodic fixed graph.
+    generated = {pn.node_mask}
     with np.load(path, allow_pickle=False) as archive:
         available = set(archive.files)
-        aliases = {}
-        if bond_descriptor_mode == RELATIVE_BOND_DESCRIPTOR:
-            # The canonical arrays seen by fixed-graph validation represent b0
-            # in relative mode, even if the source also stores per-row active
-            # descriptors under bond_prob/bond_mask.
-            aliases[prop_keys[pn.bond_prob]] = prop_keys[pn.bond_prob_s0]
-            aliases[prop_keys[pn.bond_mask]] = prop_keys[pn.bond_mask_s0]
         missing = []
         for name in properties:
             key = prop_keys[name]
-            source_key = aliases.get(key, key)
-            if name not in generated and source_key not in available:
+            if name not in generated and key not in available:
                 missing.append(key)
         if missing:
             raise KeyError(f'Delta-offset file {path} is missing model arrays {missing}.')
         data = {}
         for name in properties:
             key = prop_keys[name]
-            source_key = aliases.get(key, key)
-            if source_key in available:
-                data[key] = np.asarray(archive[source_key])
+            if key in available:
+                data[key] = np.asarray(archive[key])
         data[DELTA_OFFSET_GROUP_KEY] = _geometry_group_ids(archive, prop_keys)
     data = unit_convert_data(data, table=conversion_table)
     return validate_and_filter_delta_offset_data(data=data, prop_keys=prop_keys)
@@ -323,7 +317,8 @@ def generate_delta_offset_targets(data_split,
                                   teacher_params,
                                   teacher_scales,
                                   prop_keys,
-                                  batch_size):
+                                  batch_size,
+                                  teacher_bond_aware=False):
     """Populate raw-unit Offset_E/F targets using a fixed, external teacher."""
     if batch_size <= 0:
         raise ValueError('Teacher prediction batch size must be positive.')
@@ -343,7 +338,9 @@ def generate_delta_offset_targets(data_split,
             stop = min(start + batch_size, n_rows)
             batch_inputs = jax.tree_util.tree_map(
                 lambda value: jnp.asarray(value[start:stop]), split)
-            teacher_outputs = teacher_fn(teacher_params, batch_inputs)
+            teacher_outputs = teacher_fn(
+                teacher_params,
+                ground_teacher_inputs(batch_inputs, prop_keys, teacher_bond_aware))
             pred_energy, pred_force = restore_ground_prediction_units(
                 outputs=teacher_outputs,
                 inputs=batch_inputs,
@@ -433,7 +430,8 @@ def train_so3krates():
                         help='Degrees for the spherical harmonic coordinates.')
 
     parser.add_argument('--bond_aware', action='store_true', required=False,
-                        help='Enable invariant bond conditioning from a precomputed NPZ graph.')
+                        help='Enable invariant bond conditioning from a precomputed NPZ graph. '
+                             'Delta-offset students always enable this contract.')
 
     parser.add_argument('--so3krates_layer_kwargs', type=json.loads, required=False, default=None,
                         metavar='{"key": value, "key1": value1, ...}',
@@ -559,6 +557,7 @@ def train_so3krates():
     ground_params = None
     ground_checkpoint_step = None
     ground_checkpoint_fingerprint = None
+    ground_bond_aware = False
     if transfer_learning:
         # Reconstruct architecture from the ground checkpoint instead of duplicating its dimensions in CLI flags.
         pretrained_ground_ckpt_dir = Path(pretrained_ground_ckpt_dir).absolute().resolve().as_posix()
@@ -567,9 +566,6 @@ def train_so3krates():
             raise ValueError('The pretrained ground checkpoint must contain an ordinary StackNet model.')
         ground_bond_aware = is_bond_aware_stacknet_metadata(ground_h)
         if delta_offset_learning:
-            if ground_bond_aware:
-                raise ValueError('Delta-offset learning currently requires an ordinary non-bond-aware '
-                                 'ground teacher. The student may still be upgraded with `--bond_aware`.')
             if restart_h is None:
                 # Load one exact teacher step once. Its parameters remain outside the
                 # student optimizer and its immutable identity is saved in metadata.
@@ -592,13 +588,33 @@ def train_so3krates():
             saved_model_h = restart_h[model_key]
             saved_delta_backbone_h = {'stack_net': saved_model_h['backbone']}
             bond_aware = is_bond_aware_stacknet_metadata(saved_delta_backbone_h)
+            if delta_offset_learning:
+                saved_layers = saved_model_h['backbone'].get('layers', ())
+                if not saved_layers or any(
+                        not layer_h.get('so3krates_layer', {}).get('bond_aware', False)
+                        for layer_h in saved_layers):
+                    raise ValueError('Delta-offset restarts require every student backbone layer '
+                                     'to be bond-aware; geometry-only offset checkpoints are not supported.')
             if args.bond_aware and not bond_aware:
                 raise ValueError('`--bond_aware` cannot change a non-bond-aware transfer restart.')
             bond_backbone_upgrade = saved_model_h.get('bond_backbone_upgrade', False)
-            bond_descriptor_mode = saved_model_h.get('bond_descriptor_mode', ABSOLUTE_BOND_DESCRIPTOR)
-            bond_feature_dim = saved_model_h.get('bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM)
+            bond_descriptor_mode = saved_model_h.get(
+                'bond_descriptor_mode',
+                None if delta_offset_learning else ABSOLUTE_BOND_DESCRIPTOR)
+            bond_feature_dim = saved_model_h.get(
+                'bond_feature_dim',
+                None if delta_offset_learning else ABSOLUTE_BOND_FEATURE_DIM)
             bond_parameter_layout = saved_model_h.get('bond_parameter_layout', LEGACY_BOND_LAYOUT)
             if delta_offset_learning:
+                if bond_descriptor_mode != ABSOLUTE_BOND_DESCRIPTOR:
+                    raise ValueError('Delta-offset restarts require canonical active-row '
+                                     '`bond_prob`/`bond_mask` conditioning.')
+                if bond_feature_dim != ABSOLUTE_BOND_FEATURE_DIM:
+                    raise ValueError('Delta-offset restarts require four-channel bond probabilities.')
+                saved_teacher_bond_aware = saved_model_h.get('teacher_bond_aware', False)
+                if saved_teacher_bond_aware != ground_bond_aware:
+                    raise ValueError('The ground teacher bond-aware architecture no longer matches the '
+                                     'delta-offset restart metadata.')
                 saved_step = saved_model_h.get('ground_checkpoint_step')
                 saved_fingerprint = saved_model_h.get('ground_checkpoint_fingerprint')
                 if (saved_step != ground_checkpoint_step
@@ -607,8 +623,9 @@ def train_so3krates():
                                      'the delta-offset checkpoint.')
         else:
             # A non-bond ground checkpoint can be upgraded only inside the trainable student.
-            bond_backbone_upgrade = bool(args.bond_aware and not ground_bond_aware)
-            bond_aware = bool(ground_bond_aware or args.bond_aware)
+            student_bond_conditioning = bool(args.bond_aware or delta_offset_learning)
+            bond_backbone_upgrade = bool(student_bond_conditioning and not ground_bond_aware)
+            bond_aware = bool(ground_bond_aware or student_bond_conditioning)
             if delta_learning:
                 # Preserve the established standard-delta behavior exactly.
                 bond_descriptor_mode = (RELATIVE_BOND_DESCRIPTOR
@@ -618,11 +635,33 @@ def train_so3krates():
                 bond_parameter_layout = (NAMED_BOND_LAYOUT if bond_backbone_upgrade
                                          else LEGACY_BOND_LAYOUT)
             else:
-                # Fresh offset runs resolve absolute-active versus relative-to-S0
-                # after inspecting the supplied excited-state NPZ schema.
-                bond_descriptor_mode = None if bond_backbone_upgrade else ABSOLUTE_BOND_DESCRIPTOR
-                bond_feature_dim = None if bond_backbone_upgrade else ABSOLUTE_BOND_FEATURE_DIM
-                bond_parameter_layout = NAMED_BOND_LAYOUT if bond_backbone_upgrade else LEGACY_BOND_LAYOUT
+                # Every offset student uses the same canonical active-row
+                # four-channel descriptor contract as SO3krateX.
+                bond_descriptor_mode = ABSOLUTE_BOND_DESCRIPTOR
+                bond_feature_dim = ABSOLUTE_BOND_FEATURE_DIM
+                if bond_backbone_upgrade:
+                    bond_parameter_layout = NAMED_BOND_LAYOUT
+                else:
+                    ground_bond_layers = [
+                        layer_h['so3krates_layer']
+                        for layer_h in ground_h['stack_net']['layers']
+                        if layer_h.get('so3krates_layer', {}).get('bond_aware', False)]
+                    if len(ground_bond_layers) != len(ground_h['stack_net']['layers']):
+                        raise ValueError('A delta-offset student requires every transferred '
+                                         'SO3krates backbone layer to be bond-aware.')
+                    ground_feature_dims = {
+                        int(layer_h.get('bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM))
+                        for layer_h in ground_bond_layers}
+                    if ground_feature_dims != {ABSOLUTE_BOND_FEATURE_DIM}:
+                        raise ValueError('A transferred delta-offset backbone must use '
+                                         'four-channel bond probabilities.')
+                    ground_layouts = {
+                        layer_h.get('bond_parameter_layout', LEGACY_BOND_LAYOUT)
+                        for layer_h in ground_bond_layers}
+                    if len(ground_layouts) != 1:
+                        raise ValueError('Every transferred delta-offset backbone layer must '
+                                         'use the same bond parameter layout.')
+                    bond_parameter_layout = ground_layouts.pop()
     else:
         bond_aware = args.bond_aware
         bond_backbone_upgrade = False
@@ -650,37 +689,33 @@ def train_so3krates():
 
     offset_state_ids = ()
     if delta_offset_learning:
-        observed_state_ids, relative_available, absolute_available = inspect_delta_offset_files(
+        observed_state_ids = inspect_delta_offset_files(
             data_files=data_files, prop_keys=prop_keys)
+        ground_descriptors_available = (
+            ground_bond_descriptors_available(data_files=data_files, prop_keys=prop_keys)
+            if ground_bond_aware else True)
         if restart_h is not None:
             offset_state_ids = tuple(restart_h['delta_offset_model'].get('state_ids', (1, 2)))
             if observed_state_ids != offset_state_ids:
                 raise ValueError('Delta-offset restart data state IDs must exactly match the saved '
                                  f'{offset_state_ids}; observed {observed_state_ids}.')
-            if bond_aware and bond_descriptor_mode == RELATIVE_BOND_DESCRIPTOR and not relative_available:
-                raise KeyError('Relative delta-offset restart data is missing required b0/active-state descriptors.')
-            if bond_aware and bond_descriptor_mode == ABSOLUTE_BOND_DESCRIPTOR and not absolute_available:
-                raise KeyError('Absolute delta-offset restart data requires per-row bond_prob/bond_mask.')
+            if ground_bond_aware and not ground_descriptors_available:
+                raise KeyError('A bond-aware ground teacher requires per-row '
+                               'bond_prob_s0/bond_mask_s0 descriptors.')
         else:
             offset_state_ids = observed_state_ids
-            if bond_backbone_upgrade:
-                if relative_available:
-                    bond_descriptor_mode = RELATIVE_BOND_DESCRIPTOR
-                    bond_feature_dim = RELATIVE_BOND_FEATURE_DIM
-                elif absolute_available:
-                    bond_descriptor_mode = ABSOLUTE_BOND_DESCRIPTOR
-                    bond_feature_dim = ABSOLUTE_BOND_FEATURE_DIM
-                else:
-                    raise KeyError('Bond-aware delta-offset training requires either active per-row '
-                                   'bond_prob/bond_mask or b0 plus active-state bond descriptors.')
+            if ground_bond_aware and not ground_descriptors_available:
+                raise KeyError('A bond-aware ground teacher requires per-row '
+                               'bond_prob_s0/bond_mask_s0 descriptors.')
 
     if bond_aware:
         # The first bond-aware port consumes only nonperiodic NPZ files with a fixed graph.
         non_npz_files = [path for path in data_files if Path(path).suffix != '.npz']
+        bond_context = '`--delta_offset`' if delta_offset_learning else '`--bond_aware`'
         if non_npz_files:
-            raise ValueError('`--bond_aware` accepts only NPZ input files with precomputed graph arrays.')
+            raise ValueError(f'{bond_context} accepts only NPZ input files with precomputed graph arrays.')
         if args.mic:
-            raise ValueError('`--bond_aware` currently supports only nonperiodic precomputed graphs.')
+            raise ValueError(f'{bond_context} currently supports only nonperiodic precomputed graphs.')
         if args.restart_from_ckpt_dir is not None and not transfer_learning:
             raise ValueError('Bond-aware SO3krates models must be trained from fresh initialization.')
 
@@ -764,15 +799,12 @@ def train_so3krates():
         for state_bond_input in state_bond_inputs:
             if state_bond_input not in inputs:
                 inputs.append(state_bond_input)
-    elif delta_offset_learning and bond_aware and bond_descriptor_mode == RELATIVE_BOND_DESCRIPTOR:
-        # S1-only datasets need only b0+b1; two-state datasets additionally retain b2.
-        state_bond_inputs = [pn.bond_prob_s0, pn.bond_mask_s0]
-        for state in offset_state_ids:
-            state_bond_inputs.extend((getattr(pn, f'bond_prob_s{state}'),
-                                      getattr(pn, f'bond_mask_s{state}')))
-        for state_bond_input in state_bond_inputs:
-            if state_bond_input not in inputs:
-                inputs.append(state_bond_input)
+    if delta_offset_learning and ground_bond_aware:
+        # These are teacher-only inputs; the student always consumes canonical
+        # active-row bond_prob/bond_mask arrays.
+        for ground_bond_input in (pn.bond_prob_s0, pn.bond_mask_s0):
+            if ground_bond_input not in inputs:
+                inputs.append(ground_bond_input)
 
     if mic:
         inputs += [pn.unit_cell]
@@ -822,8 +854,7 @@ def train_so3krates():
                 path=d,
                 inputs=inputs,
                 prop_keys=prop_keys,
-                conversion_table=conversion_table,
-                bond_descriptor_mode=bond_descriptor_mode)
+                conversion_table=conversion_table)
             if not set(file_state_ids).issubset(offset_state_ids):
                 raise ValueError(f'Unexpected active states {file_state_ids} in {d}.')
             if bond_aware:
@@ -942,7 +973,8 @@ def train_so3krates():
             teacher_params=ground_params,
             teacher_scales=teacher_scales,
             prop_keys=prop_keys,
-            batch_size=teacher_batch_size)
+            batch_size=teacher_batch_size,
+            teacher_bond_aware=ground_bond_aware)
 
     scales = {}
     if args.loss_variance_scaling:
@@ -1027,16 +1059,10 @@ def train_so3krates():
                 pn.atomic_position, pn.atomic_type, pn.energy, pn.force, pn.active_state]
             if mic:
                 required_source_properties.extend((pn.unit_cell, pn.pbc))
-            if bond_aware:
-                required_source_properties.extend((pn.idx_i, pn.idx_j, pn.pair_mask))
-                if bond_descriptor_mode == ABSOLUTE_BOND_DESCRIPTOR:
-                    required_source_properties.extend((pn.bond_prob, pn.bond_mask))
-                else:
-                    required_source_properties.extend((pn.bond_prob_s0, pn.bond_mask_s0))
-                    for state in offset_state_ids:
-                        required_source_properties.extend(
-                            (getattr(pn, f'bond_prob_s{state}'),
-                             getattr(pn, f'bond_mask_s{state}')))
+            required_source_properties.extend(
+                (pn.idx_i, pn.idx_j, pn.pair_mask, pn.bond_prob, pn.bond_mask))
+            if ground_bond_aware:
+                required_source_properties.extend((pn.bond_prob_s0, pn.bond_mask_s0))
             required_dataset_keys = tuple(
                 prop_keys[name] for name in dict.fromkeys(required_source_properties))
             net = init_state_routed_offset_so3krates(
@@ -1044,6 +1070,7 @@ def train_so3krates():
                 pretrained_ground_ckpt_dir=pretrained_ground_ckpt_dir,
                 ground_checkpoint_step=ground_checkpoint_step,
                 ground_checkpoint_fingerprint=ground_checkpoint_fingerprint,
+                teacher_bond_aware=ground_bond_aware,
                 freeze_pretrained_backbone=args.freeze_pretrained_backbone,
                 bond_backbone_upgrade=bond_backbone_upgrade,
                 bond_descriptor_mode=bond_descriptor_mode,

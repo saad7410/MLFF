@@ -450,7 +450,20 @@ class DataSet:
                 raise ValueError(f'Annotated `{prob_key}` rows must sum to one within the metadata tolerance.')
             state_descriptors[state] = (state_prob, state_mask)
 
-        if 0 in state_descriptors:
+        # Physical-delta files persist descriptors for S0/S1/S2 and use S0 as
+        # their canonical input. Delta-offset files instead use the active
+        # state canonically and carry only an additional S0 teacher tensor.
+        # Prefer explicit sidecar semantics, with the descriptor layout as a
+        # compatibility fallback when the sidecar is unavailable.
+        canonical_bond_state = (None if self.graph_metadata is None else
+                                self.graph_metadata.get('canonical_bond_state'))
+        if canonical_bond_state not in (None, 0, 'state_0', 'active_state'):
+            raise ValueError('`canonical_bond_state` must be 0, `state_0`, or `active_state`.')
+        canonical_is_state_0 = (
+            canonical_bond_state in (0, 'state_0')
+            or (canonical_bond_state is None and len(state_descriptors) > 1)
+        )
+        if 0 in state_descriptors and canonical_is_state_0:
             state_0_prob, state_0_mask = state_descriptors[0]
             if not np.array_equal(bond_prob, state_0_prob) or not np.array_equal(bond_mask, state_0_mask):
                 raise ValueError('Canonical `bond_prob`/`bond_mask` must be exact aliases of state-0 descriptors.')

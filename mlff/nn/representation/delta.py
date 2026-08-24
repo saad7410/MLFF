@@ -16,6 +16,9 @@ from mlff.properties import property_names as pn
 
 
 ABSOLUTE_BOND_DESCRIPTOR = 'absolute_state'
+# Retained only so legacy imports fail at the model-validation boundary with a
+# useful message; routed offset conditioning itself is no longer supported.
+ROUTED_ABSOLUTE_BOND_DESCRIPTOR = 'absolute_active_state'
 RELATIVE_BOND_DESCRIPTOR = 'relative_to_s0'
 LEGACY_BOND_LAYOUT = 'legacy_auto'
 NAMED_BOND_LAYOUT = 'named_v1'
@@ -23,6 +26,30 @@ RELATIVE_BOND_FEATURE_DIM = 12
 ABSOLUTE_BOND_FEATURE_DIM = 4
 DELTA_OFFSET_TRAINING_MODE = 'delta_offset'
 OFFSET_SIGN_CONVENTION = 'active_minus_teacher'
+
+
+def ground_teacher_inputs(inputs: Dict,
+                          prop_keys: Dict,
+                          teacher_bond_aware: bool) -> Dict:
+    """Route state-0 bond descriptors to a frozen bond-aware ground teacher.
+
+    Delta-offset batches may expose active-state descriptors under the
+    canonical ``bond_prob``/``bond_mask`` names for the trainable student.  A
+    ground-state teacher must instead see the matching S0 descriptors.
+    """
+    if not teacher_bond_aware:
+        return inputs
+
+    bond_prob_0_key = prop_keys[pn.bond_prob_s0]
+    bond_mask_0_key = prop_keys[pn.bond_mask_s0]
+    missing = [key for key in (bond_prob_0_key, bond_mask_0_key) if key not in inputs]
+    if missing:
+        raise KeyError(f'Bond-aware ground teacher requires state-0 descriptors {missing}.')
+
+    teacher_inputs = dict(inputs)
+    teacher_inputs[prop_keys[pn.bond_prob]] = inputs[bond_prob_0_key]
+    teacher_inputs[prop_keys[pn.bond_mask]] = inputs[bond_mask_0_key]
+    return teacher_inputs
 
 
 def build_relative_bond_descriptor(bond_prob_0,
@@ -262,13 +289,14 @@ def init_delta_model(h: Dict,
 
 
 class StateRoutedOffsetSo3krates(nn.Module):
-    """One-output offset model routed by the zero-based active electronic state."""
+    """Bond-conditioned one-output offset routed by the active electronic state."""
     backbone: StackNet
     offset_head: StateDeltaHead
     prop_keys: Dict
     pretrained_ground_ckpt_dir: str = None
     ground_checkpoint_step: int = None
     ground_checkpoint_fingerprint: str = None
+    teacher_bond_aware: bool = False
     freeze_pretrained_backbone: bool = False
     bond_backbone_upgrade: bool = False
     bond_descriptor_mode: str = ABSOLUTE_BOND_DESCRIPTOR
@@ -280,20 +308,35 @@ class StateRoutedOffsetSo3krates(nn.Module):
     teacher_prediction_mode: str = 'online_before_optimization'
 
     def setup(self):
-        required = (pn.offset_energy, pn.offset_force, pn.active_state)
+        required = (pn.offset_energy, pn.offset_force, pn.active_state,
+                    pn.bond_prob, pn.bond_mask)
         missing = [name for name in required if name not in self.prop_keys]
         if missing:
             raise KeyError(f'Delta-offset SO3krates is missing property mappings for {missing}.')
+        if self.teacher_bond_aware:
+            missing_teacher_mappings = [
+                name for name in (pn.bond_prob_s0, pn.bond_mask_s0)
+                if name not in self.prop_keys]
+            if missing_teacher_mappings:
+                raise KeyError('Bond-aware ground teacher is missing property mappings for '
+                               f'{missing_teacher_mappings}.')
         if tuple(sorted(set(self.state_ids))) != tuple(self.state_ids):
             raise ValueError('`state_ids` must be sorted and unique.')
         if not self.state_ids or any(state not in (1, 2) for state in self.state_ids):
             raise ValueError('Delta-offset learning supports non-empty state IDs drawn from (1, 2).')
         if self.offset_sign_convention != OFFSET_SIGN_CONVENTION:
             raise ValueError(f'Unsupported offset sign convention `{self.offset_sign_convention}`.')
-        if self.bond_descriptor_mode not in (ABSOLUTE_BOND_DESCRIPTOR, RELATIVE_BOND_DESCRIPTOR):
-            raise ValueError(f'Unknown delta-offset bond descriptor mode `{self.bond_descriptor_mode}`.')
+        if self.bond_descriptor_mode != ABSOLUTE_BOND_DESCRIPTOR:
+            raise ValueError('Delta-offset SO3krates requires canonical four-channel '
+                             '`bond_prob`/`bond_mask` inputs with '
+                             f'`bond_descriptor_mode={ABSOLUTE_BOND_DESCRIPTOR}`.')
+        if self.bond_feature_dim != ABSOLUTE_BOND_FEATURE_DIM:
+            raise ValueError('Delta-offset SO3krates requires four-channel bond probabilities.')
 
         bond_layers = [layer for layer in self.backbone.layers if getattr(layer, 'bond_aware', False)]
+        if not self.backbone.layers or len(bond_layers) != len(self.backbone.layers):
+            raise ValueError('Every delta-offset backbone layer must be bond-aware; '
+                             'geometry-only offset models are not supported.')
         incompatible = [
             layer for layer in bond_layers
             if (getattr(layer, 'bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM) != self.bond_feature_dim
@@ -302,56 +345,15 @@ class StateRoutedOffsetSo3krates(nn.Module):
         ]
         if incompatible:
             raise ValueError('Delta-offset bond metadata must match every bond-aware backbone layer.')
-        if self.bond_descriptor_mode == RELATIVE_BOND_DESCRIPTOR:
-            if len(bond_layers) != len(self.backbone.layers):
-                raise ValueError('Relative offset descriptors require every backbone layer to be bond-aware.')
-            if self.bond_feature_dim != RELATIVE_BOND_FEATURE_DIM:
-                raise ValueError('Relative offset descriptors require 12-channel bond-aware layers.')
 
-    def _state_specific_value(self, inputs: Dict, property_base: str, state):
-        """Select the active state's descriptor without evaluating two backbones."""
-        if len(self.state_ids) == 1:
-            property_name = getattr(pn, f'{property_base}_s{self.state_ids[0]}')
-            key = self.prop_keys[property_name]
-            if key not in inputs:
-                raise KeyError(f'Delta-offset state {self.state_ids[0]} requires `{key}`.')
-            return inputs[key]
-
-        values = []
-        for state_id in self.state_ids:
-            property_name = getattr(pn, f'{property_base}_s{state_id}')
-            key = self.prop_keys[property_name]
-            if key not in inputs:
-                raise KeyError(f'Delta-offset state {state_id} requires `{key}`.')
-            values.append(inputs[key])
-        # Only states 1 and 2 are supported, so a scalar selector is sufficient
-        # and remains JIT/vmap safe.
-        return jnp.where(state == self.state_ids[1], values[1], values[0])
-
-    def _state_inputs(self, inputs: Dict, state) -> Dict:
-        bond_aware = any(getattr(layer, 'bond_aware', False) for layer in self.backbone.layers)
-        if not bond_aware or self.bond_descriptor_mode == ABSOLUTE_BOND_DESCRIPTOR:
-            # Absolute mode consumes the active per-row canonical bond_prob/bond_mask
-            # arrays directly. It does not require dense s1/s2 descriptor tensors.
-            return inputs
-
-        bond_prob_0_key = self.prop_keys[pn.bond_prob_s0]
-        bond_mask_0_key = self.prop_keys[pn.bond_mask_s0]
-        missing_ground = [key for key in (bond_prob_0_key, bond_mask_0_key) if key not in inputs]
-        if missing_ground:
-            raise KeyError(f'Relative delta-offset learning requires state-0 descriptors {missing_ground}.')
-
-        state_prob = self._state_specific_value(inputs, 'bond_prob', state)
-        state_mask = self._state_specific_value(inputs, 'bond_mask', state)
-        descriptor, descriptor_mask = build_relative_bond_descriptor(
-            bond_prob_0=inputs[bond_prob_0_key],
-            bond_mask_0=inputs[bond_mask_0_key],
-            bond_prob_state=state_prob,
-            bond_mask_state=state_mask)
-        state_inputs = dict(inputs)
-        state_inputs[self.prop_keys[pn.bond_prob]] = descriptor
-        state_inputs[self.prop_keys[pn.bond_mask]] = descriptor_mask
-        return state_inputs
+    def _state_inputs(self, inputs: Dict) -> Dict:
+        """Require the canonical active-row descriptor consumed by SO3krateX."""
+        bond_prob_key = self.prop_keys[pn.bond_prob]
+        bond_mask_key = self.prop_keys[pn.bond_mask]
+        missing = [key for key in (bond_prob_key, bond_mask_key) if key not in inputs]
+        if missing:
+            raise KeyError(f'Delta-offset SO3krates requires active-row bond descriptors {missing}.')
+        return inputs
 
     @nn.compact
     def __call__(self, inputs: Dict, *args, **kwargs) -> Dict[str, jnp.ndarray]:
@@ -359,7 +361,7 @@ class StateRoutedOffsetSo3krates(nn.Module):
         if state_key not in inputs:
             raise KeyError(f'Delta-offset input is missing active-state array `{state_key}`.')
         state = jnp.asarray(inputs[state_key], dtype=jnp.int32).reshape(())
-        quantities = self.backbone.forward_features(self._state_inputs(inputs, state=state))
+        quantities = self.backbone.forward_features(self._state_inputs(inputs))
         offset_energy = self.offset_head(quantities, state=state)
         return {self.prop_keys[pn.offset_energy]: offset_energy}
 
@@ -372,6 +374,7 @@ class StateRoutedOffsetSo3krates(nn.Module):
             'pretrained_ground_ckpt_dir': self.pretrained_ground_ckpt_dir,
             'ground_checkpoint_step': self.ground_checkpoint_step,
             'ground_checkpoint_fingerprint': self.ground_checkpoint_fingerprint,
+            'teacher_bond_aware': self.teacher_bond_aware,
             'freeze_pretrained_backbone': self.freeze_pretrained_backbone,
             'bond_backbone_upgrade': self.bond_backbone_upgrade,
             'bond_descriptor_mode': self.bond_descriptor_mode,
@@ -396,6 +399,7 @@ def init_state_routed_offset_so3krates(
         pretrained_ground_ckpt_dir: str,
         ground_checkpoint_step: int,
         ground_checkpoint_fingerprint: str,
+        teacher_bond_aware: bool = False,
         freeze_pretrained_backbone: bool = False,
         bond_backbone_upgrade: bool = False,
         bond_descriptor_mode: str = ABSOLUTE_BOND_DESCRIPTOR,
@@ -408,14 +412,23 @@ def init_state_routed_offset_so3krates(
     if feature_dim is None:
         raise ValueError('The delta-offset head requires a backbone feature embedding with `features`.')
 
+    if bond_descriptor_mode != ABSOLUTE_BOND_DESCRIPTOR:
+        raise ValueError('Delta-offset SO3krates supports only canonical active-row '
+                         f'`{ABSOLUTE_BOND_DESCRIPTOR}` bond descriptors.')
+
     prop_keys = dict(backbone.prop_keys)
     bond_layers = [layer for layer in backbone.layers if getattr(layer, 'bond_aware', False)]
+    if not backbone.layers or len(bond_layers) != len(backbone.layers):
+        raise ValueError('Every delta-offset backbone layer must be bond-aware; '
+                         'upgrade a geometry-only ground backbone before initialization.')
     if bond_feature_dim is None:
         feature_dims = {getattr(layer, 'bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM)
                         for layer in bond_layers}
         if len(feature_dims) > 1:
             raise ValueError('Every delta-offset bond-aware layer must use the same descriptor width.')
         bond_feature_dim = next(iter(feature_dims), ABSOLUTE_BOND_FEATURE_DIM)
+    if bond_feature_dim != ABSOLUTE_BOND_FEATURE_DIM:
+        raise ValueError('Delta-offset SO3krates requires four-channel bond probabilities.')
     if bond_parameter_layout is None:
         layouts = {getattr(layer, 'bond_parameter_layout', LEGACY_BOND_LAYOUT)
                    for layer in bond_layers}
@@ -433,6 +446,7 @@ def init_state_routed_offset_so3krates(
         pretrained_ground_ckpt_dir=pretrained_ground_ckpt_dir,
         ground_checkpoint_step=ground_checkpoint_step,
         ground_checkpoint_fingerprint=ground_checkpoint_fingerprint,
+        teacher_bond_aware=teacher_bond_aware,
         freeze_pretrained_backbone=freeze_pretrained_backbone,
         bond_backbone_upgrade=bond_backbone_upgrade,
         bond_descriptor_mode=bond_descriptor_mode,
@@ -450,7 +464,35 @@ def init_delta_offset_model(h: Dict,
     if offset_h.get('training_mode', DELTA_OFFSET_TRAINING_MODE) != DELTA_OFFSET_TRAINING_MODE:
         raise ValueError('Delta-offset model metadata has an incompatible training mode.')
 
-    backbone = init_stack_net({'stack_net': offset_h['backbone']})
+    descriptor_mode = offset_h.get('bond_descriptor_mode')
+    if descriptor_mode != ABSOLUTE_BOND_DESCRIPTOR:
+        raise ValueError('Delta-offset checkpoints must explicitly record canonical four-channel '
+                         f'`bond_descriptor_mode={ABSOLUTE_BOND_DESCRIPTOR}` conditioning.')
+    bond_feature_dim = offset_h.get('bond_feature_dim')
+    if bond_feature_dim != ABSOLUTE_BOND_FEATURE_DIM:
+        raise ValueError('Delta-offset checkpoints must explicitly record `bond_feature_dim: 4`.')
+    backbone_h = offset_h.get('backbone')
+    if not isinstance(backbone_h, dict):
+        raise KeyError('Delta-offset checkpoint metadata is missing its backbone configuration.')
+    layer_configs = backbone_h.get('layers', ())
+    if not layer_configs or any(
+            not layer_h.get('so3krates_layer', {}).get('bond_aware', False)
+            for layer_h in layer_configs):
+        raise ValueError('Delta-offset checkpoints require a fully bond-aware SO3krates backbone; '
+                         'geometry-only checkpoints are not supported.')
+    layer_feature_dims = {
+        int(layer_h['so3krates_layer'].get('bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM))
+        for layer_h in layer_configs}
+    if layer_feature_dims != {ABSOLUTE_BOND_FEATURE_DIM}:
+        raise ValueError('Every delta-offset checkpoint layer must consume four-channel bond probabilities.')
+    bond_parameter_layout = offset_h.get('bond_parameter_layout', LEGACY_BOND_LAYOUT)
+    layer_parameter_layouts = {
+        layer_h['so3krates_layer'].get('bond_parameter_layout', LEGACY_BOND_LAYOUT)
+        for layer_h in layer_configs}
+    if layer_parameter_layouts != {bond_parameter_layout}:
+        raise ValueError('Delta-offset checkpoint bond parameter metadata must match every backbone layer.')
+
+    backbone = init_stack_net({'stack_net': backbone_h})
     offset_head = StateDeltaHead(**offset_h['offset_head'])
     freeze_backbone = (offset_h.get('freeze_pretrained_backbone', False)
                        if freeze_pretrained_backbone is None else freeze_pretrained_backbone)
@@ -461,11 +503,12 @@ def init_delta_offset_model(h: Dict,
         pretrained_ground_ckpt_dir=offset_h.get('pretrained_ground_ckpt_dir'),
         ground_checkpoint_step=offset_h.get('ground_checkpoint_step'),
         ground_checkpoint_fingerprint=offset_h.get('ground_checkpoint_fingerprint'),
+        teacher_bond_aware=offset_h.get('teacher_bond_aware', False),
         freeze_pretrained_backbone=freeze_backbone,
         bond_backbone_upgrade=offset_h.get('bond_backbone_upgrade', False),
-        bond_descriptor_mode=offset_h.get('bond_descriptor_mode', ABSOLUTE_BOND_DESCRIPTOR),
-        bond_feature_dim=offset_h.get('bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM),
-        bond_parameter_layout=offset_h.get('bond_parameter_layout', LEGACY_BOND_LAYOUT),
+        bond_descriptor_mode=descriptor_mode,
+        bond_feature_dim=bond_feature_dim,
+        bond_parameter_layout=bond_parameter_layout,
         state_ids=tuple(offset_h.get('state_ids', (1, 2))),
         offset_sign_convention=offset_h.get('offset_sign_convention', OFFSET_SIGN_CONVENTION),
         required_dataset_keys=tuple(offset_h.get('required_dataset_keys', ())),

@@ -254,8 +254,9 @@ def evaluate():
 
         # test_data = dict(np.load(data_path))
         test_data = unit_convert_data(test_data, table=conversion_table)
-        if bond_aware:
-            # Exclude saved provenance arrays before DataSet processes the checkpoint's fixed graph.
+        if data_path.suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
             test_data = select_data_for_model(data=test_data,
                                               inputs=coach.inputs,
                                               targets=targets,
@@ -288,8 +289,9 @@ def evaluate():
             test_data = dict(data_loader.load_all())
 
         test_data = unit_convert_data(test_data, table=conversion_table)
-        if bond_aware:
-            # Exclude saved provenance arrays before DataSet processes the explicit fixed graph.
+        if Path(apply_to).suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
             test_data = select_data_for_model(data=test_data,
                                               inputs=coach.inputs,
                                               targets=targets,
@@ -336,8 +338,9 @@ def evaluate():
             test_data = dict(data_loader.load_all())
 
         test_data = unit_convert_data(test_data, table=conversion_table)
-        if bond_aware:
-            # Exclude saved provenance arrays before DataSet restores the requested fixed-graph split.
+        if Path(apply_to).suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
             test_data = select_data_for_model(data=test_data,
                                               inputs=coach.inputs,
                                               targets=targets,

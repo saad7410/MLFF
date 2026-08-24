@@ -23,6 +23,9 @@ from mlff.cAPI.process_argparse import StoreDictKeyPair
 from mlff.data import DataSet, DataTuple, load_precomputed_graph_metadata
 from mlff.io import checkpoint_fingerprint, load_params_from_ckpt_dir, read_json
 from mlff.nn import init_delta_offset_model, restore_ground_prediction_units
+from mlff.nn.representation.delta import (ABSOLUTE_BOND_DESCRIPTOR,
+                                          ABSOLUTE_BOND_FEATURE_DIM,
+                                          ground_teacher_inputs)
 from mlff.nn.stacknet import get_delta_offset_energy_force_fn, get_obs_and_force_fn, init_stack_net
 from mlff.properties import property_names as pn
 from mlff.training import Coach
@@ -48,6 +51,25 @@ def _require_delta_offset_checkpoint(h: Mapping, ckpt_dir) -> Mapping:
     if metadata.get('teacher_prediction_mode') != 'online_before_optimization':
         raise ValueError('Delta-offset checkpoint does not record the supported frozen-teacher '
                          'prediction mode.')
+    if metadata.get('bond_descriptor_mode') != ABSOLUTE_BOND_DESCRIPTOR:
+        raise ValueError('Delta-offset evaluation requires a checkpoint with canonical active-row '
+                         '`bond_prob`/`bond_mask` conditioning.')
+    if metadata.get('bond_feature_dim') != ABSOLUTE_BOND_FEATURE_DIM:
+        raise ValueError('Delta-offset evaluation requires four-channel bond probabilities.')
+    backbone_h = metadata.get('backbone')
+    if not isinstance(backbone_h, Mapping):
+        raise ValueError('Delta-offset checkpoint is missing its backbone metadata.')
+    layers = backbone_h.get('layers', ())
+    if not layers or any(
+            not layer_h.get('so3krates_layer', {}).get('bond_aware', False)
+            for layer_h in layers):
+        raise ValueError('Delta-offset evaluation requires a fully bond-aware backbone; '
+                         'geometry-only offset checkpoints are not supported.')
+    layer_feature_dims = {
+        int(layer_h['so3krates_layer'].get('bond_feature_dim', ABSOLUTE_BOND_FEATURE_DIM))
+        for layer_h in layers}
+    if layer_feature_dims != {ABSOLUTE_BOND_FEATURE_DIM}:
+        raise ValueError('Every delta-offset backbone layer must consume four-channel bond probabilities.')
     return metadata
 
 
@@ -90,25 +112,19 @@ def _load_excited_npz_data(path,
                            trained_states: Sequence[int],
                            bond_aware: bool,
                            r_cut: float,
-                           mic: bool = False,
-                           bond_descriptor_mode: str = 'absolute_state'):
+                           mic: bool = False):
     """Load only model inputs and active labels, explicitly ignoring oracle-like arrays."""
     path = Path(path)
     if path.suffix != '.npz':
         raise ValueError('Delta-offset evaluation requires an NPZ with active-state E/F labels.')
+    if not bond_aware:
+        raise ValueError('Delta-offset evaluation requires a bond-aware student checkpoint.')
+    if mic:
+        raise ValueError('Bond-aware delta-offset evaluation supports only nonperiodic data.')
 
-    # Ordinary DataSet splitting synthesizes neighbor indices, node masks, and periodic edge offsets.
-    # A fixed bond-aware graph, in contrast, must preserve every serialized model input.
-    derived_properties = {pn.idx_i, pn.idx_j, pn.node_mask, pn.cell_offset}
-    raw_inputs = tuple(
-        (name for name in inputs if name != pn.node_mask)
-        if bond_aware else
-        (name for name in inputs if name not in derived_properties))
+    # A fixed bond-aware graph must preserve every serialized model input.
+    raw_inputs = tuple(name for name in inputs if name != pn.node_mask)
     required_properties = list(dict.fromkeys((*raw_inputs, pn.energy, pn.force, pn.active_state)))
-    if mic and not bond_aware:
-        for periodic_property in (pn.unit_cell, pn.pbc):
-            if periodic_property not in required_properties:
-                required_properties.append(periodic_property)
     required_properties = tuple(required_properties)
     missing_mappings = [name for name in required_properties if name not in prop_keys]
     if missing_mappings:
@@ -119,17 +135,6 @@ def _load_excited_npz_data(path,
     with np.load(path, allow_pickle=False) as archive:
         available = set(archive.files)
         source_keys = {key: key for key in required_keys}
-        if bond_descriptor_mode == 'relative_to_s0':
-            # Match training: relative mode always canonicalizes the fixed-graph
-            # bond arrays from b0. A source file may also contain per-row active
-            # canonical arrays, which must not be mistaken for the S0 baseline.
-            aliases = {
-                prop_keys[pn.bond_prob]: prop_keys[pn.bond_prob_s0],
-                prop_keys[pn.bond_mask]: prop_keys[pn.bond_mask_s0],
-            }
-            for target_key, source_key in aliases.items():
-                if target_key in source_keys:
-                    source_keys[target_key] = source_key
         missing_keys = [target for target, source in source_keys.items()
                         if source not in available]
         if missing_keys:
@@ -194,8 +199,7 @@ def _load_excited_npz_data(path,
     if invalid_real_force.any():
         raise ValueError('Active forces must be finite on every non-padded atom.')
 
-    graph_metadata = (load_precomputed_graph_metadata(path, r_cut=r_cut)
-                      if bond_aware else None)
+    graph_metadata = load_precomputed_graph_metadata(path, r_cut=r_cut)
     return selected, graph_metadata
 
 
@@ -433,9 +437,10 @@ def evaluate_delta_offset():
     teacher_h = read_json(teacher_dir / 'hyperparameters.json')
     if 'stack_net' not in teacher_h or teacher_h.get('training_mode') in ('delta', 'delta_offset'):
         raise ValueError('The pinned teacher must be an ordinary ground-state StackNet checkpoint.')
-    if is_bond_aware_stacknet_metadata(teacher_h):
-        raise ValueError('The pinned delta-offset teacher must be non-bond-aware; only the '
-                         'trainable offset student may consume active-state bond descriptors.')
+    teacher_bond_aware = is_bond_aware_stacknet_metadata(teacher_h)
+    if offset_metadata.get('teacher_bond_aware', False) != teacher_bond_aware:
+        raise ValueError('The pinned teacher bond-aware architecture does not match the '
+                         'delta-offset checkpoint metadata.')
 
     offset_net = init_delta_offset_model(offset_h)
     teacher_net = init_stack_net(teacher_h)
@@ -450,12 +455,18 @@ def evaluate_delta_offset():
     backbone_h = offset_metadata['backbone']
     bond_aware = is_bond_aware_stacknet_metadata({'stack_net': backbone_h})
     r_cut, mic = _geometry_settings(backbone_h)
-    if bond_aware and mic:
+    if not bond_aware:
+        raise ValueError('Delta-offset evaluation requires a bond-aware student checkpoint.')
+    if mic:
         raise ValueError('Bond-aware delta-offset evaluation supports only nonperiodic checkpoints.')
 
     coach = Coach(**offset_h['coach'])
     inputs = list(coach.inputs)
-    for required_input in (pn.atomic_type, pn.atomic_position, pn.active_state):
+    required_inputs = [pn.atomic_type, pn.atomic_position, pn.idx_i, pn.idx_j,
+                       pn.pair_mask, pn.bond_prob, pn.bond_mask, pn.active_state]
+    if teacher_bond_aware:
+        required_inputs.extend((pn.bond_prob_s0, pn.bond_mask_s0))
+    for required_input in required_inputs:
         if required_input not in inputs:
             inputs.append(required_input)
 
@@ -473,8 +484,7 @@ def evaluate_delta_offset():
         trained_states=trained_states,
         bond_aware=bond_aware,
         r_cut=r_cut,
-        mic=mic,
-        bond_descriptor_mode=offset_metadata.get('bond_descriptor_mode', 'absolute_state'))
+        mic=mic)
     data_set = DataSet(data=data, prop_keys=prop_keys, graph_metadata=graph_metadata)
     split = _evaluation_split(data_set=data_set,
                               ckpt_dir=offset_ckpt_dir,
@@ -504,7 +514,9 @@ def evaluate_delta_offset():
 
     def combined_obs_fn(params, batch_inputs):
         teacher_variables, offset_variables = params
-        teacher_outputs = teacher_obs_fn(teacher_variables, batch_inputs)
+        teacher_outputs = teacher_obs_fn(
+            teacher_variables,
+            ground_teacher_inputs(batch_inputs, prop_keys, teacher_bond_aware))
         offset_outputs = offset_obs_fn(offset_variables, batch_inputs)
         teacher_energy, teacher_force = restore_ground_prediction_units(
             teacher_outputs,

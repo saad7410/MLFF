@@ -1,0 +1,9 @@
+                                         #Use file "initconds"? [True] 
+                                         #How should the excited-state lists be generated? [2] 
+../iconds                                #Path to ICOND directories: (autocomplete enabled) 
+no                                       #Do you want to use the diagonal representation (yes=diag, no=MCH)? 
+2                                        #How should the excited states be flagged? [3] 
+                                         #Range (eV): [0.0 10.0] 
+2                                        #List of initial states: (range comprehension enabled) 
+                                         #Lower state for excitation? [1] 
+                                         #Do you want to continue? [True] 

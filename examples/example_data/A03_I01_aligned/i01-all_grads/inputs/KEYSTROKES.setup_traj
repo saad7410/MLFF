@@ -1,0 +1,45 @@
+                                         #Use file "initconds.excited"? [True] 
+                                         #Number of states: [3] 
+                                         #Do you want all states to be active? [True] 
+                                         #Do you want to see the content of the initconds file? [True] 
+3                                        #States to setup the dynamics: [2 3] (range comprehension enabled) 
+                                         #Starting index: [1] 
+90                                       #Number of trajectories: [500] 
+123456                                   #RNG Seed:  [!] 
+4                                        #Interface number: 
+                                         #Method: [1] 
+100.0                                    #Simulation time (fs): [1000.0] 
+0.5                                      #Simulation timestep (fs): [0.5] 
+                                         #Integrator: [2] 
+                                         #Nsubsteps: [25] 
+                                         #Do you want to prematurely terminate trajectories? [False] 
+                                         #SHARC dynamics? [True] 
+                                         #Coupling number: [4] 
+                                         #GradCorrect: [1] 
+                                         #EkinCorrect: [2] 
+                                         #Reflect frustrated: [1] 
+                                         #Decoherence scheme: [2] 
+                                         #Hopping scheme: [2] 
+                                         #Forced hops to ground state? [False] 
+                                         #Scaling? [False] 
+                                         #Damping? [False] 
+                                         #Atom masking? [False] 
+                                         #Do you want to include a laser field in the simulation? [False] 
+                                         #Path to MOLCAS: [$MOLCAS/] (autocomplete enabled) 
+/scratch/                                #Path to scratch directory: (autocomplete enabled) 
+                                         #Use this template file? [True] 
+                                         #Do you have initial wavefunction files for Singlet? [True] 
+2                                        #JobIph files (1) or RasOrb files (2)? 
+../freq/MOLCAS.RasOrb                    #Initial wavefunction file for Singlets: [MOLCAS.1.RasOrb.init] (autocomplete enabled) 
+8000                                     #MOLCAS memory: 
+1                                        #Number of CPUs: 
+                                         #Write output in NetCDF format? [False] 
+y                                        #Write gradients? [False] 
+y                                        #Write NACs? [False] 
+n                                        #Write property matrices? [False] 
+n                                        #Write property vectors? [False] 
+y                                        #Write overlap matrix? [True] 
+                                         #Modify stride? [False] 
+                                         #Use mode 1 (i.e., calculate here)? [True] 
+                                         #Generate submission script? [False] 
+                                         #Do you want to setup the specified calculations? [True] 
