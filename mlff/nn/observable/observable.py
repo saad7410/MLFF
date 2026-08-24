@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import flax.linen as nn
+import numbers
 
 from jax.ops import segment_sum
 from jax.nn.initializers import constant
@@ -105,6 +106,50 @@ class Energy(BaseSubModule):
                                    'zbl_repulsion_shift': self.zbl_repulsion_shift,
                                    'prop_keys': self.prop_keys}
                 }
+
+
+class StateDeltaHead(BaseSubModule):
+    feature_dim: int
+    prop_keys: Dict
+    n_states: int = 3
+    module_name: str = 'state_delta'
+
+    def setup(self):
+        if self.n_states <= 2:
+            raise ValueError('StateDeltaHead needs at least three state slots for s0/s1/s2.')
+
+    @nn.compact
+    def __call__(self, inputs: Dict, state: int, *args, **kwargs):
+        # Preserve eager validation for the standard two-output delta path while
+        # also accepting a traced per-sample state in routed offset models.
+        if isinstance(state, numbers.Integral) and (state < 0 or state >= self.n_states):
+            raise ValueError(f'State index {state} is outside configured range 0..{self.n_states - 1}.')
+
+        x = inputs['x']
+        point_mask = inputs['point_mask']
+
+        # Condition every atom feature on the requested electronic state with one shared embedding table.
+        state = jnp.asarray(state, dtype=jnp.int32).reshape(())
+        state_ids = jnp.full((x.shape[0],), state, dtype=jnp.int32)
+        state_features = nn.Embed(num_embeddings=self.n_states,
+                                  features=self.feature_dim,
+                                  name='state_embedding')(state_ids)
+
+        # Use one shared readout for both excited states so only the state embedding selects the correction.
+        state_x = jnp.concatenate((x, state_features), axis=-1)
+        delta_e_loc = MLP(features=[self.feature_dim, 1],
+                          activation_fn=silu,
+                          name='readout')(state_x).squeeze(axis=-1)
+
+        # Remove padded atoms before summing local corrections into one structure-level energy delta.
+        delta_e_loc = safe_scale(delta_e_loc, scale=point_mask)
+        return delta_e_loc.sum(axis=-1, keepdims=True)
+
+    def __dict_repr__(self) -> Dict[str, Dict[str, Any]]:
+        return {self.module_name: {'feature_dim': self.feature_dim,
+                                   'prop_keys': self.prop_keys,
+                                   'n_states': self.n_states,
+                                   'module_name': self.module_name}}
 
 
 class ZBLRepulsion(nn.Module):

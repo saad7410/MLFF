@@ -5,6 +5,7 @@ import os
 
 from functools import partial
 from flax.traverse_util import flatten_dict, unflatten_dict
+from pathlib import Path
 
 from typing import Dict, Sequence
 
@@ -14,6 +15,44 @@ from mlff.io import read_json, save_dict, merge_dicts
 from mlff.data.preprocessing import get_per_atom_shift
 from mlff.properties import property_names as pn
 
+
+# Fix the public descriptor order so model inputs and dataset metadata cannot silently disagree.
+BOND_CHANNELS = ('single', 'aromatic', 'double', 'triple')
+
+
+def load_precomputed_graph_metadata(npz_path, r_cut):
+    # Accept the conventional sibling JSON name and the explicit `.npz.json` variant.
+    npz_path = Path(npz_path)
+    candidates = (npz_path.with_suffix('.json'), Path(f'{npz_path}.json'))
+    metadata_path = next((path for path in candidates if path.exists()), None)
+
+    if metadata_path is None:
+        # Missing sidecars are allowed for compatibility, but users lose cutoff/channel provenance checks.
+        logging.warning('No adjacent graph metadata JSON found for %s; validating NPZ arrays only.', npz_path)
+        return None
+
+    # Load the sidecar once and validate every explicit compatibility field.
+    metadata = read_json(metadata_path)
+    validate_precomputed_graph_metadata(metadata=metadata, r_cut=r_cut, source=metadata_path)
+    return metadata
+
+
+def validate_precomputed_graph_metadata(metadata, r_cut, source='graph metadata'):
+    # Reject an explicit cutoff mismatch because the supplied graph cannot be rebuilt safely.
+    if 'r_cut' in metadata and not np.isclose(float(metadata['r_cut']), float(r_cut)):
+        raise ValueError(f'Precomputed graph cutoff mismatch in {source}: '
+                         f'{metadata["r_cut"]} != model r_cut {r_cut}.')
+
+    # Support the source-pipeline names seen in adjacent dataset metadata.
+    channel_keys = ('bond_channels', 'bond_prob_channels', 'bond_channel_order')
+    channel_key = next((key for key in channel_keys if key in metadata), None)
+    if channel_key is not None and tuple(metadata[channel_key]) != BOND_CHANNELS:
+        raise ValueError(f'Bond channel metadata in {source} must be ordered as {BOND_CHANNELS}.')
+
+    if 'r_cut' not in metadata or channel_key is None:
+        # Incomplete metadata remains usable, while making the missing provenance visible.
+        logging.warning('Graph metadata %s does not contain both `r_cut` and bond channel order.', source)
+
 try:
     from jax import tree as _jtree
     tree_map = _jtree.map          # JAX ≥ 0.4.25 (incl. 0.6.x)
@@ -22,9 +61,10 @@ except Exception:
 
 
 class DataSet:
-    def __init__(self, prop_keys: Dict, data: Dict):
+    def __init__(self, prop_keys: Dict, data: Dict, graph_metadata: Dict = None):
         self.prop_keys = prop_keys
         self.data = data
+        self.graph_metadata = graph_metadata
         self.data, self.n_data = self._correct_shapes()
         self.splits = {}
         self.splits_info = {}
@@ -42,11 +82,20 @@ class DataSet:
         # get n_data, kind of messy but best way I could think of
         q_data = {k: v for k, v in self.data.items()}
 
-        # if energy exists in data, make sure it has the correct dimensions
-        try:
-            q_data[self.prop_keys[pn.energy]] = q_data[self.prop_keys[pn.energy]].reshape(-1, 1)
-        except KeyError:
-            pass
+        # Keep every structure-level energy target in the shared (B, 1) convention.
+        scalar_energy_properties = (pn.energy, pn.delta_energy_1, pn.delta_energy_2,
+                                    pn.offset_energy, pn.pred_energy_0)
+        for property_name in scalar_energy_properties:
+            property_key = self.prop_keys.get(property_name)
+            if property_key in q_data:
+                q_data[property_key] = q_data[property_key].reshape(-1, 1)
+
+        # Electronic-state labels are structure scalars, not shared metadata. Keeping
+        # them in (B, 1) form prevents the generic one-dimensional correction below
+        # from treating a length-B state vector as one structure with B features.
+        active_state_key = self.prop_keys.get(pn.active_state)
+        if active_state_key in q_data:
+            q_data[active_state_key] = q_data[active_state_key].reshape(-1, 1)
 
         def reshape(y):
             if len(y.shape) <= 1:
@@ -117,12 +166,23 @@ class DataSet:
                     training: bool,
                     r_cut: float = None,
                     mic: str = None,
-                    split_name: str = 'split'):
+                    split_name: str = 'split',
+                    precomputed_graph: bool = False):
 
         if mic == 'bins':
             logging.warning(f'mic={mic} is deprecated in favor of mic=True.')
         if mic == 'naive':
             raise DeprecationWarning(f'mic={mic} is not longer supported.')
+
+        if precomputed_graph:
+            # This first bond-aware port intentionally accepts only nonperiodic precomputed graphs.
+            if mic:
+                raise ValueError('Precomputed bond-aware graphs are currently supported only for nonperiodic data.')
+            if r_cut is None:
+                raise ValueError('`r_cut` is required to validate and record a precomputed graph split.')
+
+            # Validate the full graph before slicing so every sample follows one aligned contract.
+            self._validate_precomputed_graph(r_cut=r_cut)
 
         node_mask_present = False
         d = {}
@@ -146,6 +206,24 @@ class DataSet:
 
         z_key = self.prop_keys.get(pn.atomic_type)
         node_msk_needed = node_mask_required(self.data[z_key])
+
+        if precomputed_graph:
+            # Preserve every supplied edge array and synthesize only the standard node mask when absent.
+            if not node_mask_present:
+                n_msk_key = self.prop_keys.get(pn.node_mask)
+                for split in ('train', 'valid', 'test'):
+                    d[split][n_msk_key] = (d[split][z_key] != 0)
+
+            # Record reproducibility metadata without rebuilding or reordering the supplied graph.
+            self._record_split(data_idx_train=data_idx_train,
+                               data_idx_valid=data_idx_valid,
+                               data_idx_test=data_idx_test,
+                               split_name=split_name,
+                               r_cut=r_cut,
+                               mic=mic,
+                               precomputed_graph=True)
+            self.data_split = d
+            return
 
         if r_cut is not None:
             R_key = self.prop_keys.get(pn.atomic_position)
@@ -246,8 +324,149 @@ class DataSet:
                                               'n_test': n_test,
                                               'n_data': self.n_data,
                                               'r_cut': r_cut,
-                                              'mic': mic}})
+                                              'mic': mic,
+                                              'precomputed_graph': False}})
         self.data_split = d
+
+    def _record_split(self,
+                      data_idx_train,
+                      data_idx_valid,
+                      data_idx_test,
+                      split_name,
+                      r_cut,
+                      mic,
+                      precomputed_graph):
+        # Store exact indices so deterministic precomputed graph splits remain reproducible.
+        self.splits.update({split_name: {'data_idx_train': np.array(data_idx_train),
+                                         'data_idx_valid': np.array(data_idx_valid),
+                                         'data_idx_test': np.array(data_idx_test)}})
+
+        # Retain the model cutoff even though no runtime neighbor construction occurs.
+        self.splits_info.update({split_name: {'n_train': len(data_idx_train),
+                                              'n_valid': len(data_idx_valid),
+                                              'n_test': len(data_idx_test),
+                                              'n_data': self.n_data,
+                                              'r_cut': r_cut,
+                                              'mic': mic,
+                                              'precomputed_graph': precomputed_graph}})
+
+    def _validate_precomputed_graph(self, r_cut):
+        # Check explicit sidecar values when the caller supplied adjacent dataset metadata.
+        if self.graph_metadata is not None:
+            validate_precomputed_graph_metadata(metadata=self.graph_metadata, r_cut=r_cut)
+
+        # Resolve semantic properties so custom NPZ key mappings remain supported.
+        required_properties = (pn.idx_i, pn.idx_j, pn.pair_mask, pn.bond_prob, pn.bond_mask)
+        missing_properties = [name for name in required_properties if self.prop_keys.get(name) not in self.data]
+        if missing_properties:
+            raise ValueError(f'Precomputed graphs require properties {missing_properties}.')
+
+        idx_i = np.asarray(self.data[self.prop_keys[pn.idx_i]])
+        idx_j = np.asarray(self.data[self.prop_keys[pn.idx_j]])
+        pair_mask = np.asarray(self.data[self.prop_keys[pn.pair_mask]])
+        bond_prob = np.asarray(self.data[self.prop_keys[pn.bond_prob]])
+        bond_mask = np.asarray(self.data[self.prop_keys[pn.bond_mask]])
+        z = np.asarray(self.data[self.prop_keys[pn.atomic_type]])
+
+        # All edge arrays must share the same batch and padded-edge dimensions.
+        if idx_i.ndim != 2 or idx_j.shape != idx_i.shape:
+            raise ValueError('`idx_i` and `idx_j` must have aligned shape (B, P).')
+        if pair_mask.shape != idx_i.shape or bond_mask.shape != idx_i.shape:
+            raise ValueError('`pair_mask` and `bond_mask` must have aligned shape (B, P).')
+        if bond_prob.shape != (*idx_i.shape, 4):
+            raise ValueError('`bond_prob` must have aligned shape (B, P, 4).')
+        if idx_i.shape[0] != self.n_data or z.shape[0] != self.n_data:
+            raise ValueError('Precomputed graph arrays must share the dataset batch dimension.')
+
+        # Masks are boolean contracts even when stored as integer or floating NPZ arrays.
+        if not np.isin(pair_mask, (0, 1)).all() or not np.isin(bond_mask, (0, 1)).all():
+            raise ValueError('`pair_mask` and `bond_mask` must contain only 0/1 values.')
+        pair_valid = pair_mask.astype(bool)
+        bond_valid = bond_mask.astype(bool)
+        if np.logical_and(bond_valid, ~pair_valid).any():
+            raise ValueError('`bond_mask` must be a subset of `pair_mask`.')
+
+        # Directed indices must be integers in bounds, while every padded edge uses the -1 sentinel.
+        if not np.issubdtype(idx_i.dtype, np.integer) or not np.issubdtype(idx_j.dtype, np.integer):
+            raise ValueError('Precomputed `idx_i` and `idx_j` arrays must use an integer dtype.')
+        if (idx_i[~pair_valid] != -1).any() or (idx_j[~pair_valid] != -1).any():
+            raise ValueError('Every edge with `pair_mask == 0` must use -1 for both directed indices.')
+        n_atoms = z.shape[1]
+        if ((idx_i[pair_valid] < 0) | (idx_i[pair_valid] >= n_atoms)).any():
+            raise ValueError('Valid `idx_i` entries must be directed atom indices within [0, N).')
+        if ((idx_j[pair_valid] < 0) | (idx_j[pair_valid] >= n_atoms)).any():
+            raise ValueError('Valid `idx_j` entries must be directed atom indices within [0, N).')
+
+        # Valid edges may not reference zero-padded atoms.
+        safe_i = np.where(pair_valid, idx_i, 0)
+        safe_j = np.where(pair_valid, idx_j, 0)
+        if (np.take_along_axis(z, safe_i, axis=1)[pair_valid] == 0).any():
+            raise ValueError('Valid `idx_i` entries may not reference padded atoms.')
+        if (np.take_along_axis(z, safe_j, axis=1)[pair_valid] == 0).any():
+            raise ValueError('Valid `idx_j` entries may not reference padded atoms.')
+
+        # Bond probabilities must be finite, nonnegative, and normalized on annotated bonded edges.
+        if not np.isfinite(bond_prob).all() or (bond_prob < 0).any():
+            raise ValueError('`bond_prob` values must be finite and nonnegative.')
+        probability_tolerance = 1e-5
+        if self.graph_metadata is not None:
+            probability_tolerance = float(self.graph_metadata.get('bond_probability_tolerance',
+                                                                  probability_tolerance))
+        bonded_sums = bond_prob.sum(axis=-1)[bond_valid]
+        if not np.isclose(bonded_sums, 1.0, atol=probability_tolerance, rtol=0).all():
+            raise ValueError('Bonded `bond_prob` rows must sum to one within the metadata tolerance.')
+
+        # Validate every supplied raw state descriptor against the same fixed edge graph. The model constructs
+        # relative 12-channel descriptors later; the persisted NPZ contract remains four probabilities per state.
+        state_descriptors = {}
+        for state in range(3):
+            prob_name = getattr(pn, f'bond_prob_s{state}')
+            mask_name = getattr(pn, f'bond_mask_s{state}')
+            prob_key = self.prop_keys.get(prob_name)
+            mask_key = self.prop_keys.get(mask_name)
+            prob_present = prob_key in self.data
+            mask_present = mask_key in self.data
+            if prob_present != mask_present:
+                raise ValueError(f'State {state} requires both `{prob_key}` and `{mask_key}`.')
+            if not prob_present:
+                continue
+
+            state_prob = np.asarray(self.data[prob_key])
+            state_mask = np.asarray(self.data[mask_key])
+            if state_prob.shape != (*idx_i.shape, 4):
+                raise ValueError(f'`{prob_key}` must have aligned shape (B, P, 4).')
+            if state_mask.shape != idx_i.shape:
+                raise ValueError(f'`{mask_key}` must have aligned shape (B, P).')
+            if not np.isin(state_mask, (0, 1)).all():
+                raise ValueError(f'`{mask_key}` must contain only 0/1 values.')
+
+            state_valid = state_mask.astype(bool)
+            if np.logical_and(state_valid, ~pair_valid).any():
+                raise ValueError(f'`{mask_key}` must be a subset of `pair_mask`.')
+            if not np.isfinite(state_prob).all() or (state_prob < 0).any():
+                raise ValueError(f'`{prob_key}` values must be finite and nonnegative.')
+            state_sums = state_prob.sum(axis=-1)[state_valid]
+            if not np.isclose(state_sums, 1.0, atol=probability_tolerance, rtol=0).all():
+                raise ValueError(f'Annotated `{prob_key}` rows must sum to one within the metadata tolerance.')
+            state_descriptors[state] = (state_prob, state_mask)
+
+        # Physical-delta files persist descriptors for S0/S1/S2 and use S0 as
+        # their canonical input. Delta-offset files instead use the active
+        # state canonically and carry only an additional S0 teacher tensor.
+        # Prefer explicit sidecar semantics, with the descriptor layout as a
+        # compatibility fallback when the sidecar is unavailable.
+        canonical_bond_state = (None if self.graph_metadata is None else
+                                self.graph_metadata.get('canonical_bond_state'))
+        if canonical_bond_state not in (None, 0, 'state_0', 'active_state'):
+            raise ValueError('`canonical_bond_state` must be 0, `state_0`, or `active_state`.')
+        canonical_is_state_0 = (
+            canonical_bond_state in (0, 'state_0')
+            or (canonical_bond_state is None and len(state_descriptors) > 1)
+        )
+        if 0 in state_descriptors and canonical_is_state_0:
+            state_0_prob, state_0_mask = state_descriptors[0]
+            if not np.array_equal(bond_prob, state_0_prob) or not np.array_equal(bond_mask, state_0_mask):
+                raise ValueError('Canonical `bond_prob`/`bond_mask` must be exact aliases of state-0 descriptors.')
 
     def random_split(self,
                      n_train,
@@ -256,7 +475,8 @@ class DataSet:
                      r_cut=None,
                      mic=None,
                      seed=0,
-                     training=True):
+                     training=True,
+                     precomputed_graph: bool = False):
 
         idx_train, idx_valid, idx_test = self.generate_split_indices(self.data,
                                                                      n_train=n_train,
@@ -270,7 +490,8 @@ class DataSet:
                          data_idx_test=idx_test,
                          training=training,
                          r_cut=r_cut,
-                         mic=mic)
+                         mic=mic,
+                         precomputed_graph=precomputed_graph)
 
     @staticmethod
     def generate_split_indices(data, n_train, n_valid, n_test=None, seed=0, draw_strat=None):
@@ -397,7 +618,15 @@ class DataSet:
     def get_data_split(self):
         return self.data_split
 
-    def load_split(self, file, r_cut, split_name, mic=None, n_train=None, n_valid=None, n_test=None):
+    def load_split(self,
+                   file,
+                   r_cut,
+                   split_name,
+                   mic=None,
+                   n_train=None,
+                   n_valid=None,
+                   n_test=None,
+                   precomputed_graph: bool = False):
         path, filename = os.path.split(file)
         split_idx = self.load_splits_from_file(path=path, filename=filename)[split_name]
         key_2_n = {'data_idx_train': n_train, 'data_idx_valid': n_valid, 'data_idx_test': n_test}
@@ -405,7 +634,11 @@ class DataSet:
         valid_keys = list(key_2_n.keys())
 
         subset_split = {k: v[:key_2_n[k]] for (k, v) in split_idx.items() if k in valid_keys}
-        self.index_split(r_cut=r_cut, mic=mic, training=False, **subset_split)
+        self.index_split(r_cut=r_cut,
+                         mic=mic,
+                         training=False,
+                         precomputed_graph=precomputed_graph,
+                         **subset_split)
 
     def save_splits_to_file(self, path, filename):
         splits_ = tree_map(lambda y: y.tolist(), self.splits)

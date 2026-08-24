@@ -13,16 +13,13 @@ import portpicker
 
 from mlff.io.io import create_directory, bundle_dicts, save_dict
 from mlff.training import Coach, Optimizer, get_loss_fn, create_train_state
-from mlff.data import DataTuple, DataSet
+from mlff.data import DataTuple, DataSet, load_precomputed_graph_metadata, select_data_for_model
 
 from mlff.nn.stacknet import get_obs_and_force_fn
 from mlff.nn import So3krates
 
-from mlff.properties import md17_property_keys as prop_keys
+from mlff.properties import md17_property_keys as default_prop_keys
 import mlff.properties.property_names as pn
-
-from examples.preprocessing.schnitsel_preprocessor import ShnitselPreprocessor
-
 
 def load_config(config_path: str | Path) -> dict:
     config_path = Path(config_path)
@@ -43,18 +40,20 @@ def filter_by_state(data: dict, state_index: int | None) -> dict:
     if state_index is None:
         return data
 
-    astate = data.get("astate", None)
+    # Prefer the source pipeline's zero-based target state while retaining the legacy active-state key.
+    state_key = "target_state" if "target_state" in data else "astate"
+    astate = data.get(state_key, None)
     if astate is None:
-        raise KeyError("NPZ data does not contain 'astate' but state_index was specified.")
+        raise KeyError("NPZ data does not contain 'target_state' or 'astate' but state_index was specified.")
 
     astate = np.asarray(astate)
     mask = (astate == state_index)
     n_sel = int(mask.sum())
-    print(f"[filter_by_state] state_index={state_index}, selected {n_sel} frames out of {astate.shape[0]}.")
+    print(f"[filter_by_state] {state_key}={state_index}, selected {n_sel} frames out of {astate.shape[0]}.")
 
     if n_sel == 0:
         raise RuntimeError(
-            f"No frames with astate == {state_index} were found. "
+            f"No frames with {state_key} == {state_index} were found. "
             "Check your config or the NC file."
         )
 
@@ -94,6 +93,15 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
 
+    # Extend a private property mapping so other training entry points keep their defaults unchanged.
+    prop_keys = dict(default_prop_keys)
+    prop_keys.setdefault(pn.pair_mask, pn.pair_mask)
+    prop_keys.setdefault(pn.bond_prob, pn.bond_prob)
+    prop_keys.setdefault(pn.bond_mask, pn.bond_mask)
+
+    # Select the fixed-graph workflow only when the model explicitly opts into bond conditioning.
+    bond_aware = bool(cfg["model"].get("bond_aware", False))
+
     # ----------------------------------------------------------------------
     # 2. Initialize JAX distributed (single process)
     # ----------------------------------------------------------------------
@@ -107,17 +115,29 @@ def main() -> None:
     # ----------------------------------------------------------------------
     # 3. Preprocess NC → NPZ using ShnitselPreprocessor
     # ----------------------------------------------------------------------
-    nc_path = cfg["data"]["nc_path"]
     state_index = cfg["data"].get("state_index")
     r_cut = float(cfg["data"].get("r_cut", 5.0))
 
-    print(f"[main] Using NC file: {nc_path}")
-    prep = ShnitselPreprocessor(nc_path)
+    if bond_aware:
+        # Bond-aware data already carries aligned graph arrays and must bypass NC preprocessing.
+        if "npz_path" not in cfg["data"]:
+            raise ValueError('`model.bond_aware=true` requires `data.npz_path`.')
+        npz_path = Path(cfg["data"]["npz_path"]).absolute().resolve()
+        if npz_path.suffix != '.npz':
+            raise ValueError('Bond-aware Shnitsel input must be an NPZ file.')
+        graph_metadata = load_precomputed_graph_metadata(npz_path, r_cut=r_cut)
+        nc_path = None
+        print(f"[main] Using precomputed bond-aware NPZ: {npz_path}")
+    else:
+        # Preserve the established NC-to-NPZ preprocessing path for ordinary SO3krates runs.
+        from examples.preprocessing.schnitsel_preprocessor import ShnitselPreprocessor
 
-
-    # Export a single NPZ 
-    npz_path = prep.export_npz(z_key="z", include_all_states=True)
-    print(f"[main] Preprocessed NPZ written to: {npz_path}")
+        nc_path = cfg["data"]["nc_path"]
+        print(f"[main] Using NC file: {nc_path}")
+        prep = ShnitselPreprocessor(nc_path)
+        npz_path = prep.export_npz(z_key="z", include_all_states=True)
+        graph_metadata = None
+        print(f"[main] Preprocessed NPZ written to: {npz_path}")
 
     # ----------------------------------------------------------------------
     # 4. Load NPZ and filter by state_index
@@ -125,22 +145,39 @@ def main() -> None:
     raw_data = dict(np.load(npz_path.as_posix(), allow_pickle=False))
     data = filter_by_state(raw_data, state_index=state_index)
 
-    core_keys = {
-        prop_keys[pn.atomic_position],  
-        prop_keys[pn.force],            
-        prop_keys[pn.energy],           
-        prop_keys[pn.atomic_type],    
-    }   
+    # Define the training contract once so NPZ selection and Coach batching cannot drift apart.
+    coach_inputs = [
+        pn.atomic_position,
+        pn.atomic_type,
+        pn.idx_i,
+        pn.idx_j,
+        pn.node_mask,
+    ]
+    coach_targets = [pn.energy, pn.force]
+    if bond_aware:
+        # Persist the supplied graph mask and bond descriptors in every training batch.
+        coach_inputs.extend([pn.pair_mask, pn.bond_prob, pn.bond_mask])
 
-    print(f"[main] Core keys expected from NPZ: {core_keys}")
-    print(f"[main] Available keys in NPZ: {set(data.keys())}")  
-
-    clean_data = {k: data[k] for k in core_keys if k in data}
-    missing = core_keys - set(clean_data.keys())
-    if missing:
-        raise KeyError(f"Missing required keys in NPZ: {missing}")
-
-    data = clean_data
+        # Drop provenance arrays before DataSet can interpret per-frame vectors as unbatched data.
+        data = select_data_for_model(data=data,
+                                     inputs=coach_inputs,
+                                     targets=coach_targets,
+                                     prop_keys=prop_keys)
+    else:
+        # Keep the legacy workflow's reduced R/E/F/z dataset exactly as before.
+        core_keys = {
+            prop_keys[pn.atomic_position],
+            prop_keys[pn.force],
+            prop_keys[pn.energy],
+            prop_keys[pn.atomic_type],
+        }
+        print(f"[main] Core keys expected from NPZ: {core_keys}")
+        print(f"[main] Available keys in NPZ: {set(data.keys())}")
+        clean_data = {k: data[k] for k in core_keys if k in data}
+        missing = core_keys - set(clean_data.keys())
+        if missing:
+            raise KeyError(f"Missing required keys in NPZ: {missing}")
+        data = clean_data
 
     # ----------------------------------------------------------------------
     # 5. Build DataSet and splits
@@ -152,7 +189,7 @@ def main() -> None:
     ckpt_dir = build_ckpt_dir(cfg)
     print(f"[main] Checkpoints and logs will be stored in: {ckpt_dir}")
 
-    data_set = DataSet(data=data, prop_keys=prop_keys)
+    data_set = DataSet(data=data, prop_keys=prop_keys, graph_metadata=graph_metadata)
 
     data_set.random_split(
         n_train=n_train,
@@ -161,7 +198,8 @@ def main() -> None:
         mic=False,
         r_cut=r_cut,
         training=True,
-        seed=cfg["training"].get("random_seed", 0)
+        seed=cfg["training"].get("random_seed", 0),
+        precomputed_graph=bond_aware
     )
 
     data_set.shift_x_by_mean_x(x=pn.energy)
@@ -203,7 +241,8 @@ def main() -> None:
         },
         so3krates_layer_kwargs={
             "n_heads": n_heads,
-            "degrees": degrees
+            "degrees": degrees,
+            "bond_aware": bond_aware,
         }
     )
 
@@ -221,21 +260,15 @@ def main() -> None:
     batch_size = int(cfg["training"]["batch_size"])
 
     coach = Coach(
-        inputs=[
-            pn.atomic_position,
-            pn.atomic_type,
-            pn.idx_i,
-            pn.idx_j,
-            pn.node_mask
-        ],
-        targets=[pn.energy, pn.force],
+        inputs=coach_inputs,
+        targets=coach_targets,
         epochs=epochs,
         training_batch_size=batch_size,
         validation_batch_size=batch_size,
         # make these configurable 
         loss_weights={pn.energy: 0.01, pn.force: 0.99},
         ckpt_dir=ckpt_dir,
-        data_path=str(nc_path),
+        data_path=str(npz_path if bond_aware else nc_path),
         net_seed=cfg["training"].get("random_seed", 0),
         training_seed=cfg["training"].get("random_seed", 0)
     )

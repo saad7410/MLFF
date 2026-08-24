@@ -1,5 +1,13 @@
 energy = 'energy'
 force = 'force'
+delta_energy_1 = 'delta_energy_1'
+delta_energy_2 = 'delta_energy_2'
+delta_force_1 = 'delta_force_1'
+delta_force_2 = 'delta_force_2'
+offset_energy = 'offset_energy'
+offset_force = 'offset_force'
+pred_energy_0 = 'pred_energy_0'
+pred_force_0 = 'pred_force_0'
 hirshfeld_volume = 'hirshfeld_volume'
 hirshfeld_volume_ratio = 'hirshfeld_volume_ratio'
 partial_charge = 'partial_charge'
@@ -10,12 +18,24 @@ atomic_energy = 'atomic_energy'
 
 atomic_position = 'atomic_position'
 atomic_type = 'atomic_type'
+active_state = 'active_state'
 
 total_charge = 'total_charge'
 total_spin = 'total_spin'
 
 idx_i = 'idx_i'
 idx_j = 'idx_j'
+
+# Expose precomputed edge masks and invariant bond descriptors as semantic properties.
+pair_mask = 'pair_mask'
+bond_prob = 'bond_prob'
+bond_mask = 'bond_mask'
+bond_prob_s0 = 'bond_prob_s0'
+bond_mask_s0 = 'bond_mask_s0'
+bond_prob_s1 = 'bond_prob_s1'
+bond_mask_s1 = 'bond_mask_s1'
+bond_prob_s2 = 'bond_prob_s2'
+bond_mask_s2 = 'bond_mask_s2'
 
 node_mask = 'node_mask'
 

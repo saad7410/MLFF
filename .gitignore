@@ -21,5 +21,8 @@ bin
 *module/
 archive/
 data
-.codex
 .venv
+xshell_scripts_4_running/
+logs/
+examples/visualization/
+examples/example_data/

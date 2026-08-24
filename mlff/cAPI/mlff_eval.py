@@ -12,7 +12,7 @@ from ase.units import *
 from pathlib import Path
 
 from mlff.cAPI.process_argparse import StoreDictKeyPair
-from mlff.data import DataSet, DataTuple
+from mlff.data import DataSet, DataTuple, load_precomputed_graph_metadata, select_data_for_model
 from mlff.inference.evaluation import evaluate_model, mae_metric, rmse_metric, r2_metric
 from mlff.io import read_json, load_params_from_ckpt_dir
 from mlff.nn.stacknet import (
@@ -41,6 +41,12 @@ def unit_convert_data(x: Dict, table: Dict):
             print('Converted {} to ase default unit.'.format(k))
             x[k] *= table[k]
     return x
+
+
+def is_bond_aware_stacknet_metadata(h: Dict) -> bool:
+    # Missing fields reconstruct old checkpoints in the unchanged legacy mode.
+    return any(layer_h.get('so3krates_layer', {}).get('bond_aware', False)
+               for layer_h in h['stack_net']['layers'])
 
 
 # TODO: save predictions to file
@@ -117,6 +123,9 @@ def evaluate():
 
     h = read_json(os.path.join(ckpt_dir, 'hyperparameters.json'))
 
+    # Infer the fixed-graph requirement from serialized layer metadata rather than a new CLI switch.
+    bond_aware = is_bond_aware_stacknet_metadata(h)
+
     coach = Coach(**h['coach'])
 
     targets = _targets if _targets is not None else coach.targets
@@ -130,6 +139,16 @@ def evaluate():
         test_net.reset_prop_keys(prop_keys=_prop_keys)
     prop_keys = test_net.prop_keys
 
+    if bond_aware:
+        # Backfill canonical keys for early bond-aware metadata that may not have serialized custom mappings.
+        prop_keys.setdefault(pn.pair_mask, pn.pair_mask)
+        prop_keys.setdefault(pn.bond_prob, pn.bond_prob)
+        prop_keys.setdefault(pn.bond_mask, pn.bond_mask)
+        coach.inputs = list(coach.inputs)
+        for bond_input in (pn.pair_mask, pn.bond_prob, pn.bond_mask):
+            if bond_input not in coach.inputs:
+                coach.inputs.append(bond_input)
+
     conversion_table = {}
     if units is not None:
         for (q, v) in units.items():
@@ -138,14 +157,17 @@ def evaluate():
 
     r_cut = [x[list(x.keys())[0]]['r_cut'] for x in h['stack_net']['geometry_embeddings'] if
              list(x.keys())[0] == 'geometry_embed'][0]
+    model_r_cut = r_cut
     mic = [x[list(x.keys())[0]]['mic'] for x in h['stack_net']['geometry_embeddings'] if
            list(x.keys())[0] == 'geometry_embed'][0]
 
     if n_cut is not None:
+        if bond_aware and not np.isclose(n_cut, model_r_cut):
+            raise ValueError('Bond-aware evaluation must use the saved precomputed graph cutoff.')
         r_cut = n_cut
-        if n_cut < r_cut:
+        if n_cut < model_r_cut:
             logging.warning(f"The specified cutoff for neighborhood calculations n_cut={n_cut} is smaller than the "
-                            f"model cutoff r_cut={r_cut}. This will likely result in wrong model prediction.")
+                            f"model cutoff r_cut={model_r_cut}. This will likely result in wrong model prediction.")
 
     test_params = load_params_from_ckpt_dir(ckpt_dir)
 
@@ -216,9 +238,15 @@ def evaluate():
         if not data_path.is_absolute():
             data_path = (Path().absolute().parent / data_path).resolve()
 
+        # Legacy loaders do not have graph sidecars; initialize the optional metadata explicitly.
+        graph_metadata = None
         if data_path.suffix == '.npz':
-            test_data = dict(np.load(data_path))
+            test_data = dict(np.load(data_path, allow_pickle=False))
+            graph_metadata = (load_precomputed_graph_metadata(data_path, r_cut=model_r_cut)
+                              if bond_aware else None)
         else:
+            if bond_aware:
+                raise ValueError('Bond-aware SO3krates evaluation requires a compatible NPZ input.')
             from mlff.data import AseDataLoader
             load_stress = pn.stress in targets
             data_loader = AseDataLoader(data_path, load_stress=load_stress)
@@ -226,35 +254,61 @@ def evaluate():
 
         # test_data = dict(np.load(data_path))
         test_data = unit_convert_data(test_data, table=conversion_table)
-        test_data_set = DataSet(prop_keys=prop_keys, data=test_data)
+        if data_path.suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
+            test_data = select_data_for_model(data=test_data,
+                                              inputs=coach.inputs,
+                                              targets=targets,
+                                              prop_keys=prop_keys)
+        test_data_set = DataSet(prop_keys=prop_keys, data=test_data, graph_metadata=graph_metadata)
         test_data_set.load_split(file=os.path.join(ckpt_dir, 'splits.json'),
                                  n_train=n_train,
                                  n_valid=n_valid,
                                  n_test=n_test,
                                  r_cut=r_cut,
                                  mic=mic,
-                                 split_name=from_split)
+                                 split_name=from_split,
+                                 precomputed_graph=bond_aware)
         d_test = test_data_set.get_data_split()[evaluate_on]
 
     elif apply_to is not None and from_split is None:
         print(f'Loading test points from {apply_to}.')
+        # Legacy loaders do not have graph sidecars; initialize the optional metadata explicitly.
+        graph_metadata = None
         if Path(apply_to).suffix == '.npz':
-            test_data = dict(np.load(apply_to))
+            test_data = dict(np.load(apply_to, allow_pickle=False))
+            graph_metadata = (load_precomputed_graph_metadata(apply_to, r_cut=model_r_cut)
+                              if bond_aware else None)
         else:
+            if bond_aware:
+                raise ValueError('Bond-aware SO3krates evaluation requires a compatible NPZ input.')
             from mlff.data import AseDataLoader
             load_stress = pn.stress in targets
             data_loader = AseDataLoader(apply_to, load_stress=load_stress)
             test_data = dict(data_loader.load_all())
 
         test_data = unit_convert_data(test_data, table=conversion_table)
-        test_data_set = DataSet(prop_keys=prop_keys, data=test_data)
+        if Path(apply_to).suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
+            test_data = select_data_for_model(data=test_data,
+                                              inputs=coach.inputs,
+                                              targets=targets,
+                                              prop_keys=prop_keys)
+        test_data_set = DataSet(prop_keys=prop_keys, data=test_data, graph_metadata=graph_metadata)
+
+        if n_test is None:
+            # Default to all samples when applying a fixed graph to an explicit NPZ.
+            n_test = len(test_data[prop_keys[pn.atomic_position]])
 
         test_data_set.index_split(data_idx_train=[],
                                   data_idx_valid=[],
                                   data_idx_test=np.arange(n_test),
                                   mic=mic,
                                   training=False,
-                                  r_cut=r_cut)
+                                  r_cut=r_cut,
+                                  precomputed_graph=bond_aware)
 
         # test_data_set.random_split(n_train=0,
         #                            n_valid=0,
@@ -269,23 +323,37 @@ def evaluate():
         print('Loading evaluation points according to the saved {} split in {} from {}.'
               .format(evaluate_on, os.path.join(ckpt_dir, 'splits.json'), apply_to))
 
+        # Legacy loaders do not have graph sidecars; initialize the optional metadata explicitly.
+        graph_metadata = None
         if Path(apply_to).suffix == '.npz':
-            test_data = dict(np.load(apply_to))
+            test_data = dict(np.load(apply_to, allow_pickle=False))
+            graph_metadata = (load_precomputed_graph_metadata(apply_to, r_cut=model_r_cut)
+                              if bond_aware else None)
         else:
+            if bond_aware:
+                raise ValueError('Bond-aware SO3krates evaluation requires a compatible NPZ input.')
             from mlff.data import AseDataLoader
             load_stress = pn.stress in targets
             data_loader = AseDataLoader(apply_to, load_stress=load_stress)
             test_data = dict(data_loader.load_all())
 
         test_data = unit_convert_data(test_data, table=conversion_table)
-        test_data_set = DataSet(prop_keys=prop_keys, data=test_data)
+        if Path(apply_to).suffix == '.npz':
+            # Exclude saved provenance arrays before DataSet shape correction can
+            # mistake per-frame metadata for shared, dimensionless values.
+            test_data = select_data_for_model(data=test_data,
+                                              inputs=coach.inputs,
+                                              targets=targets,
+                                              prop_keys=prop_keys)
+        test_data_set = DataSet(prop_keys=prop_keys, data=test_data, graph_metadata=graph_metadata)
         test_data_set.load_split(file=os.path.join(ckpt_dir, 'splits.json'),
                                  n_train=n_train,
                                  n_valid=n_valid,
                                  n_test=n_test,
                                  r_cut=r_cut,
                                  mic=mic,
-                                 split_name=from_split)
+                                 split_name=from_split,
+                                 precomputed_graph=bond_aware)
         d_test = test_data_set.get_data_split()[evaluate_on]
     else:
         msg = 'One should not end up here. This is likely due to a bug in the mlff package. Please report to ' \

@@ -1,251 +1,191 @@
-# MLFF
-Repository for training, testing and developing machine learned force fields using the `SO3krates` transformer [1, 2].
+# MLFF: SO3krateX and delta-learning extensions
+
+This repository is a research fork of [`thorben-frank/mlff`](https://github.com/thorben-frank/mlff), the original MLFF implementation of the SO3krates transformer developed by J. Thorben Frank and collaborators.
+
+Relative to the `origin/main` baseline, this fork focuses on bond-conditioned SO3krates—called **SO3krateX** here—and two excited-state transfer-learning models: physical delta learning and delta-offset learning. For the original SO3krates quickstart, ASE calculator, molecular dynamics, and general MLFF documentation, see the [upstream README](https://github.com/thorben-frank/mlff#readme).
+
+## What this fork adds
+
+| Mode | Main addition | Training entry point |
+| --- | --- | --- |
+| SO3krateX | SO3krates conditioned on fixed, state-specific four-channel bond probabilities | `train_so3krates --bond_aware` |
+| Physical delta | Shared-backbone models for aligned `S1-S0` and `S2-S0` energy/force corrections | `train_so3krates --delta` |
+| Delta-offset | Active-state residuals against a pinned, frozen S0 teacher; the student is always bond-aware | `train_so3krates --delta_offset` |
+| Preprocessing | Reusable NetCDF and NPZ builders for ordinary, SO3krateX, physical-delta, and delta-offset datasets | `examples/preprocessing/make_datasets/` |
+| Evaluation | Reconstruction-aware evaluators for both delta formulations | `evaluate_delta` and `evaluate_delta_offset` |
+
+SO3krateX is a bond-aware configuration of the existing SO3krates model, not a separate `train_so3krateX` executable or exported model class.
+
+## Model extensions
+
+### SO3krateX
+
+SO3krateX injects an invariant bond descriptor into the radial-spherical filters of both SO3krates attention paths. The fixed descriptor order is:
+
+```text
+[single, anti-bonding, double, triple]
+```
+
+Bond-aware inputs use a directed, padded graph with `idx_i`, `idx_j`, `pair_mask`, `bond_prob`, and `bond_mask`. The model does not infer bonds at runtime. Dataset loading validates graph alignment, padded `-1` edge indices, masks, finite nonnegative probabilities, normalized annotated rows, channel order, and the graph cutoff when metadata is available.
+
+Train a fresh SO3krateX model with:
+
+```bash
+train_so3krates \
+  --bond_aware \
+  --data_file so3kratex_dataset.npz \
+  --n_train 1000 \
+  --n_valid 100 \
+  --r_cut 5.0 \
+  --ckpt_dir so3kratex_module
+```
+
+Evaluation reads the bond-aware architecture from `hyperparameters.json` and requires a compatible precomputed graph:
+
+```bash
+evaluate \
+  --ckpt_dir so3kratex_module \
+  --apply_to so3kratex_dataset.npz
+```
+
+### Physical delta learning
+
+Physical delta learning requires row-aligned S0, S1, and S2 labels and optimizes:
+
+```text
+Delta_E1 = E1 - E0          Delta_F1 = F1 - F0
+Delta_E2 = E2 - E0          Delta_F2 = F2 - F0
+```
+
+The ground checkpoint supplies the architecture and transferred representation parameters. A learned state embedding and shared delta head distinguish S1 from S2.
+
+```bash
+train_so3krates \
+  --delta \
+  --pretrained_ground_ckpt_dir ground_module \
+  --data_file delta_dataset.npz \
+  --n_train 1000 \
+  --n_valid 100 \
+  --ckpt_dir delta_module
+```
+
+Reconstruct and evaluate S0, S1, and S2 with:
+
+```bash
+evaluate_delta \
+  --delta_ckpt_dir delta_module \
+  --apply_to delta_dataset.npz \
+  --batch_size 1
+```
+
+Physical-delta metadata records the ground checkpoint path, not an immutable checkpoint fingerprint. Keep that directory stable: evaluation loads its latest checkpoint step unless `--ground_ckpt_dir` overrides it. The current physical-delta evaluator also skips a final incomplete batch, so choose a batch size that divides the selected row count or use `--batch_size 1` when every row must be evaluated.
+
+### Delta-offset learning
+
+Delta-offset learning is intended for active-state S1/S2 rows that do not have aligned S0/S1/S2 labels. A pinned ground checkpoint predicts the S0 baseline on each active geometry, and the trainer forms:
+
+```text
+Offset_E = E_active - E_teacher,S0
+Offset_F = F_active - F_teacher,S0
+```
+
+The frozen teacher identity, including its checkpoint step and fingerprint, is stored with the offset checkpoint. Reconstruction adds the learned offset back to that teacher prediction.
+
+Every delta-offset student follows the SO3krateX descriptor contract:
+
+- every backbone layer is bond-aware;
+- canonical `bond_prob`/`bond_mask` contain the active-state four-channel descriptor;
+- `bond_prob_s0`/`bond_mask_s0` are routed to the frozen teacher when that teacher is bond-aware;
+- geometry-only, relative-descriptor, and routed legacy offset checkpoints are rejected.
+
+```bash
+train_so3krates \
+  --delta_offset \
+  --pretrained_ground_ckpt_dir ground_module \
+  --data_file delta_offset_dataset.npz \
+  --n_train 1000 \
+  --n_valid 100 \
+  --ckpt_dir delta_offset_module
+```
+
+`--bond_aware` is not needed in this command: delta-offset students enable the four-channel bond branches automatically.
+
+Evaluate active-state reconstruction with:
+
+```bash
+evaluate_delta_offset \
+  --delta_offset_ckpt_dir delta_offset_module \
+  --apply_to delta_offset_dataset.npz
+```
+
+## Dataset preparation
+
+The canonical builders live under:
+
+- [NetCDF builders](examples/preprocessing/make_datasets/from_nc/README.md)
+- [NPZ builders](examples/preprocessing/make_datasets/from_npz/README.md)
+
+Both interfaces accept one or more plain positional paths, so inputs look like `A03.nc I01.nc ...` or `A03_data.npz I01_data.npz ...`. Users do not assign paths with `A03=...` or `I01=...`. A unique uppercase molecule tag is inferred from each filename only to match dataset provenance and the bond-spec YAML.
+
+The current builder names contain no `_v2` suffix:
+
+- `make_so3krates_dataset.py` builds descriptor-free SO3krates data;
+- `make_so3krateX_dataset.py` builds state-expanded SO3krateX data;
+- `make_delta_dataset.py` builds aligned physical-delta data;
+- `make_delta_offset_dataset.py` builds active-state delta-offset data.
+
+The three bond-aware builders require `--bond-specs`. Supply a YAML entry for every required molecule/state pair; `mol_id` must match the uppercase tag inferred from the source filename. See the [example bond specification](examples/example_data/bond_spec_alkenes.yaml).
+
+
+Replace `from_nc` with `from_npz` and pass appropriately named NPZ archives for the NPZ workflow. Aggregate NPZ archives are preferred for physical delta because separately filtered state files are normally not row-aligned. NPZ builders preserve values as provided and `--r-cut` uses the same distance unit as `R`; the trainer and evaluators convert values only when `--units` is explicitly supplied. Keep teacher, active, and delta data physically consistent and repeat the same explicit unit mapping during evaluation. The NetCDF reader converts declared source units to Å, eV, and eV/Å and records the conversion metadata.
+
+Each builder writes the training NPZ and adjacent JSON provenance, including source files, graph cutoff, channel order, state selection, and descriptor semantics.
+
 ## Installation
-Assuming you have already set up an virtual environment with python version `>= 3.9.` In order to ensure compatibility
-with CUDA `jax/jaxlib` have to be installed manually. Therefore **before** you install `MLFF` run one of the following 
-commands (depending on your CUDA version)
-```
-pip install --upgrade pip
 
-# CUDA 12 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+The current `pyproject.toml` requires Python 3.12 or newer. Clone this fork and select the editable install matching your hardware:
 
-# CUDA 11 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```bash
+git clone --branch delta-learning https://github.com/saad7410/MLFF.git
+cd MLFF
+python -m pip install --upgrade pip
 ```
-for details check the official [`JAX`](https://github.com/google/jax#pip-installation-gpu-cuda-installed-via-pip-easier) 
-repository.
 
-Next clone the `mlff` repository by running
-```
-git clone https://github.com/thorben-frank/mlff.git
-```
- 
-Now do
-```
-cd mlff
-pip install -e .
-```
-which completes the installation and installs remaining dependencies.
-## Weights and Bias
-If you do not have a weights and bias account already you can create on [here](https://wandb.ai/site). After installing
-``mlff`` run
-```
-wandb login
-```
-and log in with your account.
-# Quickstart
-Following we will give a quick start how to train, evaluate and run an MD simulation with the 
-`SO3krates` model.
-## Training
-Train your fist `So3krates` model by running
-```
-train_so3krates --data_file data.xyz  --n_train 1000 --n_valid 100 --wandb_init project=so3krates,name=first_run
-```
-The `--data_file` can be any format digestible by the `ase.io.read` method. In case minimal image convention
-should be applied, add `--mic` to the command. The model parameters will be saved per default to `module/`. Another 
-directory can be specified using `--ckpt_dir $CKPT_DIR`, which will safe the model parameters to `$CKPT_DIR/`. 
-More details on training can be found in the detailed training section below.
-## Evaluation
-After training, change into the model directory, e.g. and run the `evaluate` command
-```
-cd module
-evaluate
-``` 
-As before, when your data is not in eV and Angstrom add the `--units` keyword. The reported metrics are then in eV and
-Angstrom (e.g. `--units energy='kcal/mol',force='kcal/(mol*Ang)'` if the energy in your data is in `kcal/mol`).
-## ASE Calculator
-Before you can use the calculator make sure you install the [`glp`](https://github.com/sirmarcel/glp) 
-package by cloning the `glp` repository and install it
-```
-git clone git@github.com:sirmarcel/glp.git
-cd glp
+For CPU:
 
-pip install .
+```bash
+python -m pip install -e ".[cpu]"
 ```
-After training you can create an ASE Calculator from the trained model via
-```python
-from mlff.md.calculator import mlffCalculator
-import numpy as np
 
-calculator = mlffCalculator.create_from_ckpt_dir(
-    'path_to_ckpt_dir',   # directory where e.g. hyperparameters.json is saved.
-    dtype=np.float32
-)
-```
-## Molecular Dynamics
-**WARNING: MD is currently under re-write so do not expect to work.**
- 
-You can use the `mdx` package which is the `mlff` internal MD package, fully relying on `jax` and thus fully 
-optimized for XLA compilation on GPU.
-First, lets create a relaxed structure, using the LBFGS optimizer
-```
-run_relaxation  --qn_max_steps 1000 --qn_tol 0.0001 --use_mdx
-```
-which will save the relaxed geometry to `relaxed_structure.h5`. Next, convert the `.h5` file to an 
-`xyz` file, by running
-```
-trajectory_to_xyz --trajectory relaxed_structure.h5 --output relaxed_structure.xyz
-```
-We now run an MD with the relaxed structure as start geometry
-```
-run_md --start_geometry relaxed_structure.xyz --thermostat velocity_verlet --temperature_init 600 --time_step 0.5 --total_time 1 --use_mdx
-```
-Temperature is in Kelvin, time step in femto seconds and total time in nano seconds. It will save a `trajectory.h5` 
-file to the current working directory.
-### Analysis
-After the MD is finished you can either work with the `trajectory.h5` using e.g. a `jupyter notebook` and `h5py`. 
-Alternatively, you can run
-```
-trajectory_to_xyz --trajectory trajectory.h5 --output trajectory.xyz
-```  
-which will create an `xyz` file. The resulting `xyz` file can be used as input to the 
-[`MDAnalysis`](https://docs.mdanalysis.org/stable/index.html) python package, which provides a broad range of functions 
-to analyse the MD simulations. The central `Universe` object can be creates easily as
-```python
-import MDAnalysis as mda
+For CUDA 12:
 
-# Load MD simulation results from xyz
-u = mda.Universe('trajectory.xyz')
+```bash
+python -m pip install -e ".[cu12]"
 ```
-# Deep Dive
-In the quickstart section we went through a few basic steps, allowing to train, validate a `so3krates` model as well 
-as running an MD simulation. If you want to learn more about each of the steps, check the following sections.
-## Training
-Lets start start from the training command already shown in the quickstart section
-```
-train_so3krates --ckpt_dir first_module --data_file atoms.xyz --n_train 1000 --n_valid 100
-```
-for which all data in `atoms.xyz` is loaded an split into `1000` data points for training, 
-`100` data points for validation and the remaining data points `n_test = n_tot - 1000 - 100` is hold back for testing 
-the potential after training. The validation data points are used to determine the best performing model during training,
-for which the parameters are saved to `first_module/checkpoint_loss_XXX` where XXX denotes the training step for which the best performing
-model was found. We will show later, how to load the checkpoint such that one use the trained potential directly in 
-`Python`.
-### Input Data Files
-`mlff` can deal with any input file that can be read by the [`ase.io.read`](https://wiki.fysik.dtu.dk/ase/ase/io/io.html#ase.io.read) method.
-Further `--data_file` admits to pass `*.npz` files. `*.npz` files allow to store `numpy.ndarray` under different `keys`. 
-Thus, `mlff` needs to "know" under which key to find e.g. the positions, the forces and so on .. Per default, `mlff` 
-assumes the following relations between property and key
-```
-{
- atomic_position: R,     # shape: (n_data, n, 3) 
- atomic_type: z,         # shape: (n_data, n) or (n)
- energy: E,              # shape: (n_data, 1)
- force: F                # shape: (n_data, n, 3)
 
- # in case mic should be applied (via --mic keyword)
- unit_cell: unit_cell    # shape: (n_data, 3, 3)  # lattice vectors are row-wise
- pbc: pbc                # shape: (n_data, 3)
-}
-```
-If you have an `*.npz` file which uses a different convention, you can specify the keys customizing the property keys
-via 
-```
-train_so3krates --ckpt_dir second_module --data_file file.npz --n_train 1000 --n_valid 100 --prop_keys atomic_position=pos,atomic_type=numbers 
-``` 
-The above examples would assume that the properties `energy` and `force` are still found under the `keys` `E` and `F`,
-respectively but `position` and `atomic_type` are found under `pos` and `numbers`.
-### Units
-Per default, `mlff` assumes the ASE default units which are `eV` for energy and `Angstrom` for coordinates. Some data
-sets, however, differ from these convention, e.g. the MD17 or the MD22 data set. You can download the corresponding 
-`*.npz` files [here](http://sgdml.org/#datasets) (Note that the `*.xyz` files provided there are not formatted in a 
-way that allows reading them via `ase.io.read` method). For both data sets the energy is is in `kcal/mol` such that 
-the forces are in `kcal/(mol*Ang)`. You can either pre-process the data yourself by applying the proper conversion 
-factors and pass the data directly into the `train_so3krates` command. Alternatively, you can set them manually by
-```
-train_so3krates --ckpt_dir dha_module --train_file dha.npz --n_train 1000 --n_valid 500 --units energy='kcal/mol',force='kcal/(mol*Ang)'
-```
-Note the character strings for the units, which are necessary in the course of internal processing. This will internally
-rescale the energy and the forces to `eV` and `eV/Ang`.
-### Minimal Image Convention
-In [3] `SO3krates` was used to calculate EOS and heat flux in solids, such that it must be capable of
-handling periodic boundary conditions. If you want to apply the minimal image convention, you can specify this by 
-adding the corresponding flag to the training command 
-```
-train_so3krates --ckpt_dir pbc_module --train_file file_with_pbc.xyz --n_train 100 --n_valid 100 --mic
-```
-Internally, `mlff` uses the [`ase.neighborlist.primitive_neighborlist`](https://wiki.fysik.dtu.dk/ase/ase/neighborlist.html#ase.neighborlist.primitive_neighbor_list) 
-for computing the atomic neighborhoods.
-### Energy Shifts
-The energy scale of the data, tend to increase rapidly with the number of atoms in the system. However, relevant scale
-of energy changes is usually on the scale of a few eV, such that one typically shifts the energy by the mean of the 
-energies in the `--n_train` training data points. This is done by default when running the `train_so3krates` command. 
-However, it might be desired to atom type specific shifts, which is possible via
-```
-train_so3krates --energy_shift_module --atoms.xyz --n_train 1000 --n_valid 200 --shifts 1=-500.30, 6=-6000.25
-```
-and would shift the energy by `-500.30` for each hydrogen in the structure and by `-6000.25` for each carbon.
-### `So3krates` Hyperparameters
-One can further vary different model hyperparameters: `--L` sets the number of message passing steps, `--F` sets the
-feature dimension, `--degrees` sets the degrees for spherical harmonic coordinates and `--r_cut` sets the cutoff for the 
-atomic neighborhoods. E.g. a model with 2 message passing layers, feature dimension 64, degree 1 and 2 and cutoff of 4 Angstrom
-can be trained by running
-```
-train_so3krates --new_hypers_module --atoms.xyz --n_train 1000 --n_valid 200 --L 2 --F 64 --degrees 1 2 --r_cut 4
-```
-### Optimization Hyperparameters
-TODO
-### Weight and Bias
-To keep track of the performed experiments, you can organize your trainings using weights and bias. You can specify the 
-project and name of the current trainings run via
-```
-train_so3krates --wandb_module --atoms.xyz --n_train 1000 --n_valid 200 --wandb_init project=so3krates,name=deep_dive_run
-```
-The arguments passed to `--wandb_init` are passed as is to the `wandb.init` for which you can find all possible 
-arguments [here](https://docs.wandb.ai/ref/python/init).
-## Validation
-In order to validate the models performance, the errors on the unseen test set are often a good starting point. Go to 
-model you want to evaluate by going to the model directory (the directory in which the checkpoint_loss_XXX file lies)
-and use the `evaluate` command
-```
-cd module
-evaluate
-``` 
-This command will evaluate the model on the test data points and print the mean absolute error (MAE), the root mean squared 
-error (RMSE) and the R2 spearson correlation. It will further save two files in the current directory which are called 
-`metrics.json` and `evaluate_predictions.npz`. The former contains the metrics which have also been printed and the latter
-contains the per data point predictions of the model. Thus, the metrics can be calculated from the `evaluate_predictions.npz`
-by using the following code snippet
-```python
-import numpy as np
+Check the current [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver and accelerator compatibility.
 
-eval_data = np.load('evaluate_predictions.npz', allow_pickle=True)
-predicted_energies = eval_data['predictions'].item()['E']
-target_energies = eval_data['targets'].item()['E']
-mae = np.abs(predicted_energies - target_energies).mean()
-print(f'MAE: {mae:.4f} (eV)')
-```
-## Use `So3krates` in Python
-While it is convenient to train and validate a model using the `CLI`, playing around with the potential is often much
-easier in `Python` in particular if it is of interest to couple it with other methods and packages. 
-### GLP
-Below you find a code snippet how to load a trained `So3krates` model and use it in `Python`.
-```python
-import jax.numpy as jnp
-from mlff.mdx import MLFFPotential
+## Current constraints
 
-ckpt_dir = 'path/to/ckpt_dir/' 
-dtype = jnp.float64
-pot = MLFFPotential.create_from_ckpt_dir(ckpt_dir=ckpt_dir, dtype=dtype)
+- Bond-aware models consume fixed, precomputed NPZ graphs and currently support only nonperiodic data.
+- The model cutoff must match the cutoff used by the dataset builder.
+- Bond annotations come from the supplied YAML; there is no runtime bond discovery.
+
+## Tests
+
+Run the focused delta-offset descriptor contract tests with:
+
+```bash
+pytest -q tests/test_delta_offset_descriptor_contract.py
 ```
-The resulting potential is a [`Potential`](https://github.com/sirmarcel/glp#potential) in the sense of the 
-the [`glp`](https://github.com/sirmarcel/glp) package. Thus, you can directly use your trained `so3krates` model to 
-perform energy, force, stress and heat flux calculations. `glp` also offers a binding to [`vibes`](https://vibes-developers.gitlab.io/vibes/), which 
-further allows you to do Phonon calculations and much more. To calculate thermal conductivities you can use the [`gkx`](https://github.com/sirmarcel/gkx) 
-package.
-### MDx
-TODO
-## Run the tests
-The test suite can be run with pytest as:
-```
-pytest tests/
-```
-## Cite
-If you use parts of the code please cite the corresponding papers
-```
+
+The upstream test suite remains under `tests/`.
+
+## Citation
+
+The SO3krates implementation in this fork is built on the original MLFF work. If you use it, cite the corresponding upstream papers:
+
+```bibtex
 @article{frank2022so3krates,
   title={So3krates: Equivariant attention for interactions on arbitrary length-scales in molecular systems},
   author={Frank, Thorben and Unke, Oliver and M{\"u}ller, Klaus-Robert},
@@ -264,9 +204,8 @@ If you use parts of the code please cite the corresponding papers
   pages={6539},
   year={2024}
 }
-
 ```
-## References
-* [1] J.T. Frank, O.T. Unke, and K.R. Müller.  [*So3krates: Equivariant attention for interactions on arbitrary length-scales in molecular systems*](https://proceedings.neurips.cc/paper_files/paper/2022/hash/bcf4ca90a8d405201d29dd47d75ac896-Abstract-Conference.html), Advances in Neural Information Processing Systems 35 (2022): 29400-29413.
-* [2] J.T. Frank, O.T. Unke, K.R. Müller and S. Chmiela.  [*A Euclidean transformer for fast and stable machine learned force fields*](https://www.nature.com/articles/s41467-024-50620-6), Nature Communications **15** (2024): 6539.
-* [3] M.F. Langer, J.T. Frank, and F. Knoop.  [*Stress and heat flux via automatic differentiation*](https://pubs.aip.org/aip/jcp/article/159/17/174105/2919546/Stress-and-heat-flux-via-automatic-differentiation), The Journal of Chemical Physics 159.17 (2023)
+
+## License
+
+This fork retains the upstream [MIT License](LICENSE.md), copyright © 2023 J. Thorben Frank.

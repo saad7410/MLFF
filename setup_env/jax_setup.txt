@@ -1,3 +1,0 @@
-micromamba search -c conda-forge "jaxlib=*=*cuda*"
-
-micromamba install -y -c conda-forge   "jax==0.7.2"   "jaxlib=0.7.2=cuda129_py311h6669c4c_200"   cuda-version=12.9   cudnn
