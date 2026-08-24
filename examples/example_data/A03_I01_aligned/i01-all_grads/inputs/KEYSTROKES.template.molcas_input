@@ -1,9 +1,0 @@
-3                                        #Type of calculation: 
-                                         #Number of electrons:  [read from MOLCAS.input] 
-1                                        #Level of theory: 
-                                         #Basis set: [cc-pvdz] 
-                                         #Use Cholesky decomposition? [False] 
-no                                       #Douglas-Kroll scalar-relativistic integrals? [True] 
-                                         #Number of active electrons: [read from MOLCAS.input] 
-                                         #Number of active orbitals: [read from MOLCAS.input] 
-                                         #Number of states: [read from MOLCAS.input] 
